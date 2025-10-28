@@ -21,7 +21,6 @@ FetchContent_Declare(
         uvent
         GIT_REPOSITORY https://github.com/Usub-development/uvent.git
         GIT_TAG main
-        OVERRIDE_FIND_PACKAGE
 )
 
 FetchContent_MakeAvailable(uvent)
@@ -30,11 +29,11 @@ file(GLOB_RECURSE ULOG_HEADERS CONFIGURE_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/include/ulog/*.h
         ${CMAKE_CURRENT_SOURCE_DIR}/include/ulog/*.hpp
 )
-file(GLOB_RECURSE ULOG_HEADERS CONFIGURE_DEPENDS
+file(GLOB_RECURSE ULOG_SOURCES CONFIGURE_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/src/ulog/*.cpp
 )
 
-add_library(ulog ${ULOG_HEADERS} ${ULOG_HEADERS})
+add_library(ulog ${ULOG_SOURCES} ${ULOG_HEADERS})
 add_library(usub::ulog ALIAS ulog)
 
 target_include_directories(ulog
