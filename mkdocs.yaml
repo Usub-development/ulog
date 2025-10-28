@@ -1,0 +1,39 @@
+site_name: ULog
+site_description: Ultra-low overhead asynchronous logger for the uvent runtime
+site_url: https://<org>.github.io/<repo>
+repo_url: https://github.com/<org>/<repo>
+
+theme:
+  name: material
+  features:
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - search.highlight
+    - content.code.copy
+  palette:
+    primary: blue
+    accent: amber
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Configuration: config.md
+  - API Reference:
+      - Logger API: api/logger.md
+      - Flush Task: api/logger-flush-task.md
+      - Internals: api/internals.md
+
+plugins:
+  - search
+  - autorefs
+  - git-revision-date-localized:
+      fallback_to_build_date: true
+  - minify
+
+markdown_extensions:
+  - codehilite
+  - admonition
+  - tables
+  - toc:
+      permalink: true

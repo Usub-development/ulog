@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.27)
 cmake_policy(SET CMP0144 NEW)
-project(ulog)
+project(ulog VERSION 0.1.0 LANGUAGES CXX)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -12,11 +15,7 @@ add_compile_definitions(DEV_STAGE=${DEV_STAGE})
 
 message(STATUS "DEV_STAGE is set to ${DEV_STAGE}")
 
-find_package(OpenSSL REQUIRED)
-find_package(PostgreSQL REQUIRED)
-
 include(FetchContent)
-include_directories(${ulog_SOURCE_DIR})
 
 FetchContent_Declare(
         uvent
@@ -27,21 +26,77 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(uvent)
 
-add_executable(${PROJECT_NAME}
-        src/main.cpp
-        include/ulog/Config.h
-        include/ulog/Logger.h
-        src/ulog/Logger.cpp
-        include/ulog/LoggerFlushTask.h
-        src/ulog/LoggerFlushTask.cpp
-        include/ulog/ulog.h
+file(GLOB_RECURSE ULOG_HEADERS CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/ulog/*.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/include/ulog/*.hpp
+)
+file(GLOB_RECURSE ULOG_HEADERS CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/ulog/*.cpp
 )
 
-target_include_directories(${PROJECT_NAME} PRIVATE
-        /usr/local/include
-        ${CMAKE_CURRENT_LIST_DIR}/include
+add_library(ulog ${ULOG_HEADERS} ${ULOG_HEADERS})
+add_library(usub::ulog ALIAS ulog)
+
+target_include_directories(ulog
+        PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ulog>
 )
 
-target_link_libraries(${PROJECT_NAME} PRIVATE
+target_link_libraries(ulog
+        PUBLIC
         usub::uvent
+)
+
+set_target_properties(ulog PROPERTIES
+        EXPORT_NAME ulog
+        VERSION ${PROJECT_VERSION}
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+)
+
+option(ULOG_BUILD_EXAMPLES "Build ulog example executables" ON)
+if (ULOG_BUILD_EXAMPLES)
+        add_executable(ulog_example examples/main.cpp)
+        target_link_libraries(ulog_example PRIVATE ulog)
+        target_compile_definitions(ulog_example PRIVATE DEV_STAGE=${DEV_STAGE})
+endif()
+
+install(TARGETS ulog
+        EXPORT ulogTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ulog
+)
+
+install(DIRECTORY include/
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ulog
+        FILES_MATCHING
+        PATTERN "*.h"
+        PATTERN "*.hpp"
+)
+
+configure_package_config_file(
+        cmake/ulogConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/ulogConfig.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ulog
+        NO_CHECK_REQUIRED_COMPONENTS_MACRO
+)
+
+write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/ulogConfigVersion.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion
+)
+
+install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/ulogConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/ulogConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ulog
+)
+
+install(EXPORT ulogTargets
+        NAMESPACE ulog::
+        FILE ulogTargets.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ulog
 )

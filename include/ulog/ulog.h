@@ -1,4 +1,5 @@
-#pragma once
+#ifndef ULOG_H
+#define ULOG_H
 
 #include <string_view>
 #include "ulog/Logger.h"
@@ -7,10 +8,9 @@
 
 namespace usub::ulog
 {
-    inline void init(const ULogInit& cfg)
+    inline void init(const ULogInit& cfg = ULogInit{})
     {
         Logger::init_internal(cfg);
-
         uvent::system::co_spawn(logger_flush_task());
     }
 
@@ -49,3 +49,5 @@ namespace usub::ulog
         Logger::pushf(Level::Error, fmt, std::forward<Args>(args)...);
     }
 }
+
+#endif

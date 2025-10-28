@@ -1,4 +1,5 @@
-#pragma once
+#ifndef LOGGER_H
+#define LOGGER_H
 
 #include <cstdint>
 #include <cstdarg>
@@ -57,26 +58,29 @@ namespace usub::ulog
 
     struct LogEntry
     {
+        // wallclock ms since epoch for timestamp
         uint64_t ts_ms;
         uint32_t thread_id;
         Level level;
         uint16_t size;
-        char msg[256];
+        char msg[4096]; // bigger buffer, spdlog-style budget
     };
 
     struct ULogInit
     {
-        const char* trace_path;
-        const char* debug_path;
-        const char* info_path;
-        const char* warn_path;
-        const char* error_path;
-
-        uint64_t flush_interval_ns;
-        std::size_t queue_capacity_pow2;
-        std::size_t batch_size;
-
-        bool enable_color_stdout;
+        const char* trace_path = nullptr;
+        const char* debug_path = nullptr;
+        const char* info_path = nullptr;
+        const char* warn_path = nullptr;
+        const char* error_path = nullptr;
+        uint64_t flush_interval_ns = 2'000'000ULL;
+        std::size_t queue_capacity_pow2 = 14; // 16384
+        std::size_t batch_size = 512;
+        bool enable_color_stdout = true;
+        std::size_t max_file_size_bytes = 0;
+        uint32_t max_files = 3;
+        bool json_mode = false;
+        bool track_metrics = false;
     };
 
     class Logger
@@ -107,20 +111,31 @@ namespace usub::ulog
 
             if (log.queue_.try_enqueue(entry))
             {
+                if (log.track_metrics_)
+                {
+                }
                 try_drain_overflow(overflow, log.queue_);
                 return;
             }
 
             if (overflow.try_push(entry))
             {
+                if (log.track_metrics_)
+                {
+                    log.metric_overflow_pushes_.fetch_add(1, std::memory_order_relaxed);
+                }
                 return;
+            }
+
+            if (log.track_metrics_)
+            {
+                log.metric_backpressure_spins_.fetch_add(1, std::memory_order_relaxed);
             }
 
             while (!log.queue_.try_enqueue(entry))
             {
                 cpu_relax();
             }
-
             try_drain_overflow(overflow, log.queue_);
         }
 
@@ -128,16 +143,16 @@ namespace usub::ulog
         static inline void pushf(Level lvl, std::string_view fmt, Args&&... args) noexcept
         {
             std::string msg;
-            msg.reserve(256);
+            msg.reserve(512);
             fmt_build(msg, fmt, std::forward<Args>(args)...);
 
-            uint16_t len = (uint16_t)std::min(msg.size(), sizeof(LogEntry::msg) - 1);
+            uint16_t len = utf8_safe_size(msg.data(), msg.size(), sizeof(LogEntry::msg) - 1);
             enqueue_with_overflow(lvl, msg.data(), len);
         }
 
         static inline void push(Level lvl, const char* fmt, ...) noexcept
         {
-            char local_buf[256];
+            char local_buf[4096];
 
             va_list ap;
             va_start(ap, fmt);
@@ -152,6 +167,7 @@ namespace usub::ulog
             else
                 len = (uint16_t)written;
 
+            len = utf8_safe_size(local_buf, len, sizeof(LogEntry::msg) - 1);
             enqueue_with_overflow(lvl, local_buf, len);
         }
 
@@ -159,12 +175,49 @@ namespace usub::ulog
 
         inline uint64_t flush_interval_ns() const noexcept { return flush_interval_ns_; }
 
+        inline uint64_t get_overflow_pushes() const noexcept
+        {
+            return metric_overflow_pushes_.load(std::memory_order_relaxed);
+        }
+
+        inline uint64_t get_backpressure_spins() const noexcept
+        {
+            return metric_backpressure_spins_.load(std::memory_order_relaxed);
+        }
+
     private:
-        Logger(int fds[LEVEL_COUNT],
-               bool color_enabled[LEVEL_COUNT],
+        struct Sink
+        {
+            int fd;
+            const char* path;
+            size_t bytes_written;
+            bool color_enabled;
+        };
+
+        Logger(Sink sinks_init[LEVEL_COUNT],
                std::size_t queue_capacity_pow2,
                std::size_t batch_size,
-               uint64_t flush_interval_ns) noexcept;
+               uint64_t flush_interval_ns,
+               std::size_t max_file_size_bytes,
+               uint32_t max_files,
+               bool json_mode,
+               bool track_metrics) noexcept
+            : batch_size_(batch_size)
+              , flush_interval_ns_(flush_interval_ns)
+              , max_file_size_bytes_(max_file_size_bytes)
+              , max_files_(max_files)
+              , json_mode_(json_mode)
+              , track_metrics_(track_metrics)
+              , shutting_down_(false)
+              , queue_(queue_capacity_pow2)
+        {
+            for (size_t i = 0; i < LEVEL_COUNT; ++i)
+            {
+                sinks_[i] = sinks_init[i];
+            }
+            metric_overflow_pushes_.store(0, std::memory_order_relaxed);
+            metric_backpressure_spins_.store(0, std::memory_order_relaxed);
+        }
 
         Logger(const Logger&) = delete;
         Logger& operator=(const Logger&) = delete;
@@ -200,16 +253,15 @@ namespace usub::ulog
             return rt;
         }
 
-
-        static inline std::size_t format_prefix_plain(const LogEntry& e,
-                                                      char* out,
-                                                      std::size_t cap) noexcept
+        static inline size_t build_timestamp_string(uint64_t ts_ms,
+                                                    char* out,
+                                                    size_t cap) noexcept
         {
-            if (cap == 0) return 0;
+            if (cap < 24)
+                return 0;
 
-            uint64_t ms_total = e.ts_ms;
-            time_t sec = (time_t)(ms_total / 1000);
-            uint32_t msec = (uint32_t)(ms_total % 1000);
+            time_t sec = (time_t)(ts_ms / 1000);
+            uint32_t msec = (uint32_t)(ts_ms % 1000);
 
             struct tm tmbuf;
             struct tm* tm_ptr = ::localtime_r(&sec, &tmbuf);
@@ -226,7 +278,6 @@ namespace usub::ulog
                 buf[1] = char('0' + (v % 10));
             };
 
-            char tsbuf[32];
             int year = tm_ptr ? (tm_ptr->tm_year + 1900) : 0;
             int mon = tm_ptr ? (tm_ptr->tm_mon + 1) : 0;
             int day = tm_ptr ? tm_ptr->tm_mday : 0;
@@ -234,23 +285,34 @@ namespace usub::ulog
             int min = tm_ptr ? tm_ptr->tm_min : 0;
             int sec2 = tm_ptr ? tm_ptr->tm_sec : 0;
 
-            tsbuf[0] = char('0' + (year / 1000) % 10);
-            tsbuf[1] = char('0' + (year / 100) % 10);
-            tsbuf[2] = char('0' + (year / 10) % 10);
-            tsbuf[3] = char('0' + (year % 10));
-            tsbuf[4] = '-';
-            u32_to_dec2((uint32_t)mon, &tsbuf[5]);
-            tsbuf[7] = '-';
-            u32_to_dec2((uint32_t)day, &tsbuf[8]);
-            tsbuf[10] = ' ';
-            u32_to_dec2((uint32_t)hr, &tsbuf[11]);
-            tsbuf[13] = ':';
-            u32_to_dec2((uint32_t)min, &tsbuf[14]);
-            tsbuf[16] = ':';
-            u32_to_dec2((uint32_t)sec2, &tsbuf[17]);
-            tsbuf[19] = '.';
-            u32_to_dec3(msec, &tsbuf[20]);
-            constexpr size_t tslen = 23;
+            out[0] = char('0' + (year / 1000) % 10);
+            out[1] = char('0' + (year / 100) % 10);
+            out[2] = char('0' + (year / 10) % 10);
+            out[3] = char('0' + (year % 10));
+            out[4] = '-';
+            u32_to_dec2((uint32_t)mon, &out[5]);
+            out[7] = '-';
+            u32_to_dec2((uint32_t)day, &out[8]);
+            out[10] = ' ';
+            u32_to_dec2((uint32_t)hr, &out[11]);
+            out[13] = ':';
+            u32_to_dec2((uint32_t)min, &out[14]);
+            out[16] = ':';
+            u32_to_dec2((uint32_t)sec2, &out[17]);
+            out[19] = '.';
+            u32_to_dec3(msec, &out[20]);
+
+            return 23;
+        }
+
+        static inline std::size_t format_prefix_plain(const LogEntry& e,
+                                                      char* out,
+                                                      std::size_t cap) noexcept
+        {
+            if (cap == 0) return 0;
+
+            char tsbuf[32];
+            size_t tslen = build_timestamp_string(e.ts_ms, tsbuf, sizeof(tsbuf));
 
             auto u64_to_buf = [](uint64_t v, char* buf, std::size_t max) noexcept -> std::size_t
             {
@@ -404,6 +466,21 @@ namespace usub::ulog
             fmt_build(out, fmt.substr(p + 2), std::forward<Rest>(rest)...);
         }
 
+        static inline uint16_t utf8_safe_size(const char* data,
+                                              size_t len,
+                                              size_t max_bytes)
+        {
+            if (len <= max_bytes)
+                return (uint16_t)len;
+
+            size_t i = max_bytes;
+            // walk back while we're on a UTF-8 continuation byte: 10xxxxxx
+            while (i > 0 && ((unsigned char)data[i] & 0xC0) == 0x80)
+                --i;
+
+            return (uint16_t)i;
+        }
+
         template <std::size_t N>
         struct ThreadOverflowRing
         {
@@ -461,15 +538,25 @@ namespace usub::ulog
             }
         }
 
+        void maybe_rotate_sink(size_t idx, size_t incoming_bytes) noexcept;
+        static void rotate_files(const char* path, uint32_t max_files) noexcept;
+
     private:
         static inline Logger* global_ = nullptr;
 
-        int fds_[LEVEL_COUNT];
-        bool color_enabled_[LEVEL_COUNT];
+        Sink sinks_[LEVEL_COUNT];
 
-        queue::concurrent::MPMCQueue<LogEntry> queue_;
         std::size_t batch_size_;
         uint64_t flush_interval_ns_;
+        std::size_t max_file_size_bytes_;
+        uint32_t max_files_;
+        bool json_mode_;
+        bool track_metrics_;
         std::atomic<bool> shutting_down_;
+        std::atomic<uint64_t> metric_overflow_pushes_{0};
+        std::atomic<uint64_t> metric_backpressure_spins_{0};
+        queue::concurrent::MPMCQueue<LogEntry> queue_;
     };
 } // namespace usub::ulog
+
+#endif // LOGGER_H

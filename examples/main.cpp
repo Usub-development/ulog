@@ -10,11 +10,11 @@ using namespace usub::uvent;
 
 uvent::task::Awaitable<void> fake_worker(int id)
 {
-    for (int i = 0; i < 5; ++i)
+    for (int i = 0; i < 500; ++i)
     {
         ulog::trace("worker={} tick={}", id, i);
         ulog::debug("worker={} recv req_id={}", id, 1000 + i);
-        ulog::info ("worker={} handled request size={}B", id, 512UL);
+        ulog::info("worker={} handled request size={}B", id, 512UL);
 
         if (i == 2)
             ulog::warn("worker={} slow op >= {} ms", id, 17.4);
@@ -23,7 +23,7 @@ uvent::task::Awaitable<void> fake_worker(int id)
             ulog::error("worker={} backend fail code={}", id, -104);
 
         co_await system::this_coroutine::sleep_for(
-            std::chrono::milliseconds(200)
+            std::chrono::milliseconds(10)
         );
     }
 
@@ -33,24 +33,23 @@ uvent::task::Awaitable<void> fake_worker(int id)
 
 int main()
 {
-    settings::timeout_duration_ms = 5000;
-
     usub::ulog::ULogInit cfg{
-        .trace_path          = "./trace.log",
-        .debug_path          = "./debug.log",
-        .info_path           = "./info.log",
-        .warn_path           = "./warn.log",
-        .error_path          = "./error.log",
-        .flush_interval_ns   = 2'000'000ULL,
-        .queue_capacity_pow2 = 14,
-        .batch_size          = 512,
-        .enable_color_stdout = true
+        .trace_path = "./trace.log",
+        .debug_path = "./debug.log",
+        .info_path = "./info.log",
+        .warn_path = "./warn.log",
+        .error_path = "./error.log",
+        .flush_interval_ns = 2'000'000ULL, // 2ms
+        .queue_capacity_pow2 = 14, // 2^14 = 16384
+        .batch_size = 512,
+        .enable_color_stdout = true,
+        .max_file_size_bytes = 10 * 1024 * 1024, // rotate at 10MB
+        .max_files = 3, // keep file.log.1..file.log.3
+        .json_mode = false, // human-readable
+        .track_metrics = true // enable contention stats
     };
 
     usub::ulog::init(cfg);
-
-    ulog::info("bootstrap start, workers={}, timeout_ms={}",
-               4, settings::timeout_duration_ms);
 
     for (int wid = 0; wid < 4; ++wid)
         uvent::system::co_spawn(fake_worker(wid));
