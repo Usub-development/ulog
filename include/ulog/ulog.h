@@ -1,0 +1,51 @@
+#pragma once
+
+#include <string_view>
+#include "ulog/Logger.h"
+#include "ulog/LoggerFlushTask.h"
+#include "uvent/system/SystemContext.h"
+
+namespace usub::ulog
+{
+    inline void init(const ULogInit& cfg)
+    {
+        Logger::init_internal(cfg);
+
+        uvent::system::co_spawn(logger_flush_task());
+    }
+
+    inline void shutdown()
+    {
+        Logger::shutdown_internal();
+    }
+
+    template <typename... Args>
+    inline void trace(std::string_view fmt, Args&&... args) noexcept
+    {
+        Logger::pushf(Level::Trace, fmt, std::forward<Args>(args)...);
+    }
+
+    template <typename... Args>
+    inline void debug(std::string_view fmt, Args&&... args) noexcept
+    {
+        Logger::pushf(Level::Debug, fmt, std::forward<Args>(args)...);
+    }
+
+    template <typename... Args>
+    inline void info(std::string_view fmt, Args&&... args) noexcept
+    {
+        Logger::pushf(Level::Info, fmt, std::forward<Args>(args)...);
+    }
+
+    template <typename... Args>
+    inline void warn(std::string_view fmt, Args&&... args) noexcept
+    {
+        Logger::pushf(Level::Warn, fmt, std::forward<Args>(args)...);
+    }
+
+    template <typename... Args>
+    inline void error(std::string_view fmt, Args&&... args) noexcept
+    {
+        Logger::pushf(Level::Error, fmt, std::forward<Args>(args)...);
+    }
+}
