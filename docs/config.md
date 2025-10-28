@@ -25,7 +25,7 @@ struct ULogInit {
     // metrics
     bool        track_metrics;       // expose overflow/backpressure stats
 };
-````
+```
 
 All fields have sane defaults in `ulog::init()` if you don't pass a config.
 

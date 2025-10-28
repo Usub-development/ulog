@@ -11,7 +11,7 @@ Add ULog to your project and include:
 ```cpp
 #include "ulog/ulog.h"
 #include "ulog/LoggerFlushTask.h"
-````
+```
 
 ULog has no external runtime dependencies beyond `uvent`.
 

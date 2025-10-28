@@ -2,7 +2,7 @@
 
 ```cpp
 uvent::task::Awaitable<void> logger_flush_task();
-````
+```
 
 `logger_flush_task()` is the only piece of code that actually touches I/O.
 

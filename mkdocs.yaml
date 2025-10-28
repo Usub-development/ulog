@@ -1,28 +1,37 @@
-site_name: ULog
+site_name: ULog Documentation
 site_description: Ultra-low overhead asynchronous logger for the uvent runtime
-site_url: https://<org>.github.io/<repo>
-repo_url: https://github.com/<org>/<repo>
+site_url: https://usub-development.github.io/ulog/
+repo_url: https://github.com/Usub-development/ulog
+repo_name: Usub-development/ulog
+edit_uri: edit/main/docs/
 
 theme:
   name: material
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: blue
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: blue
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
   features:
     - navigation.top
     - navigation.instant
     - navigation.tracking
     - search.highlight
     - content.code.copy
-  palette:
-    primary: blue
-    accent: amber
-
-nav:
-  - Home: index.md
-  - Getting Started: getting-started.md
-  - Configuration: config.md
-  - API Reference:
-      - Logger API: api/logger.md
-      - Flush Task: api/logger-flush-task.md
-      - Internals: api/internals.md
 
 plugins:
   - search
@@ -32,8 +41,35 @@ plugins:
   - minify
 
 markdown_extensions:
-  - codehilite
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
   - admonition
+  - attr_list
   - tables
   - toc:
       permalink: true
+
+nav:
+  - Overview: index.md
+  - Getting Started: getting-started.md
+  - Configuration: config.md
+  - API Reference:
+      - Logger API: api/logger.md
+      - Flush Task: api/logger-flush-task.md
+      - Internals: api/internals.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/Usub-development/ulog
+      name: GitHub Repository
+    - icon: fontawesome/solid/star
+      link: https://github.com/Usub-development/ulog/stargazers
+      name: Star on GitHub
+
+copyright: >
+  Copyright © 2025 Usub-development, Kirill Zhukov (g2px1)

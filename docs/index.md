@@ -29,7 +29,7 @@ The flusher coroutine executes in your existing `uvent::Uvent` worker pool.
 
 [2025-10-28 12:03:44.861][3][I] starting event loop...
 
-````
+```
 
 Where:
 
@@ -87,7 +87,7 @@ int main() {
     ulog::init(cfg);
     ulog::info("Logger initialized, queue_size={}, flush={}ns", 1 << cfg.queue_capacity_pow2, cfg.flush_interval_ns);
 }
-````
+```
 
 ---
 

@@ -14,7 +14,7 @@ enum class Level : uint8_t {
     Warn  = 3,
     Error = 4
 };
-````
+```
 
 Public wrappers:
 
