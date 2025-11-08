@@ -22,14 +22,7 @@
 
 namespace usub::ulog
 {
-    enum class Level : uint8_t
-    {
-        Trace = 0,
-        Debug = 1,
-        Info = 2,
-        Warn = 3,
-        Error = 4
-    };
+    enum class Level : uint8_t { Trace, Debug, Info, Warn, Error };
 
     static inline constexpr size_t LEVEL_COUNT = 5;
 
@@ -48,22 +41,21 @@ namespace usub::ulog
 
     struct AnsiColors
     {
-        const char* trace_prefix = "\x1b[90m"; // gray
-        const char* debug_prefix = "\x1b[36m"; // cyan
-        const char* info_prefix = "\x1b[32m"; // green
-        const char* warn_prefix = "\x1b[33m"; // yellow
-        const char* error_prefix = "\x1b[31m"; // red
+        const char* trace_prefix = "\x1b[90m";
+        const char* debug_prefix = "\x1b[36m";
+        const char* info_prefix = "\x1b[32m";
+        const char* warn_prefix = "\x1b[33m";
+        const char* error_prefix = "\x1b[31m";
         const char* reset = "\x1b[0m";
     };
 
     struct LogEntry
     {
-        // wallclock ms since epoch for timestamp
         uint64_t ts_ms;
         uint32_t thread_id;
         Level level;
         uint16_t size;
-        char msg[4096]; // bigger buffer, spdlog-style budget
+        char msg[4096];
     };
 
     struct ULogInit
@@ -74,7 +66,7 @@ namespace usub::ulog
         const char* warn_path = nullptr;
         const char* error_path = nullptr;
         uint64_t flush_interval_ns = 2'000'000ULL;
-        std::size_t queue_capacity_pow2 = 14; // 16384
+        std::size_t queue_capacity_pow2 = 14;
         std::size_t batch_size = 512;
         bool enable_color_stdout = true;
         std::size_t max_file_size_bytes = 0;
@@ -89,54 +81,60 @@ namespace usub::ulog
         static void init_internal(const ULogInit& cfg) noexcept;
         static void shutdown_internal() noexcept;
 
-        static inline Logger& instance() noexcept { return *global_; }
+        static inline Logger& instance() noexcept { return *global_.load(std::memory_order_acquire); }
+        static inline Logger* try_instance() noexcept { return global_.load(std::memory_order_acquire); }
 
         static inline void enqueue_with_overflow(Level lvl,
                                                  const char* msg_data,
                                                  uint16_t msg_len) noexcept
         {
+            Logger* lg = try_instance();
+            if (!lg) return;
+            if (lg->is_shutting_down()) return;
+
             thread_local ThreadOverflowRing<64> overflow;
 
-            LogEntry entry;
+            LogEntry entry{};
             entry.ts_ms = now_ms_wallclock();
             entry.thread_id = get_thread_id_fast();
             entry.level = lvl;
-            entry.size = msg_len;
-            if (msg_len)
-                ::memcpy(entry.msg, msg_data, msg_len);
-            if (msg_len < sizeof(entry.msg))
-                entry.msg[msg_len] = '\0';
 
-            Logger& log = instance();
+            uint16_t safe_len = msg_len;
+            if (safe_len >= sizeof(entry.msg)) safe_len = sizeof(entry.msg) - 1;
+            if (safe_len) ::memcpy(entry.msg, msg_data, safe_len);
+            entry.msg[safe_len] = '\0';
+            entry.size = safe_len;
+
+            Logger& log = *lg;
+            auto overflow_non_empty = [](const auto& r) noexcept { return r.head != r.tail; };
 
             if (log.queue_.try_enqueue(entry))
             {
-                if (log.track_metrics_)
-                {
-                }
-                try_drain_overflow(overflow, log.queue_);
+                if (overflow_non_empty(overflow) && !log.is_shutting_down())
+                    try_drain_overflow(overflow, log.queue_);
+
+                if (!log.flusher_running()) log.flush_once_batch();
                 return;
             }
 
             if (overflow.try_push(entry))
             {
                 if (log.track_metrics_)
-                {
                     log.metric_overflow_pushes_.fetch_add(1, std::memory_order_relaxed);
-                }
+                if (!log.flusher_running()) log.flush_once_batch();
                 return;
             }
 
             if (log.track_metrics_)
-            {
                 log.metric_backpressure_spins_.fetch_add(1, std::memory_order_relaxed);
-            }
 
             while (!log.queue_.try_enqueue(entry))
-            {
                 cpu_relax();
-            }
-            try_drain_overflow(overflow, log.queue_);
+
+            if (overflow_non_empty(overflow) && !log.is_shutting_down())
+                try_drain_overflow(overflow, log.queue_);
+
+            if (!log.flusher_running()) log.flush_once_batch();
         }
 
         template <typename... Args>
@@ -160,12 +158,9 @@ namespace usub::ulog
             va_end(ap);
 
             uint16_t len;
-            if (written <= 0)
-                len = 0;
-            else if ((std::size_t)written >= sizeof(local_buf))
-                len = (uint16_t)(sizeof(local_buf) - 1);
-            else
-                len = (uint16_t)written;
+            if (written <= 0) len = 0;
+            else if ((std::size_t)written >= sizeof(local_buf)) len = (uint16_t)(sizeof(local_buf) - 1);
+            else len = (uint16_t)written;
 
             len = utf8_safe_size(local_buf, len, sizeof(LogEntry::msg) - 1);
             enqueue_with_overflow(lvl, local_buf, len);
@@ -183,6 +178,21 @@ namespace usub::ulog
         inline uint64_t get_backpressure_spins() const noexcept
         {
             return metric_backpressure_spins_.load(std::memory_order_relaxed);
+        }
+
+        inline bool is_shutting_down() const noexcept
+        {
+            return shutting_down_.load(std::memory_order_acquire);
+        }
+
+        inline void mark_flusher_started() noexcept
+        {
+            flusher_started_.store(true, std::memory_order_release);
+        }
+
+        inline bool flusher_running() const noexcept
+        {
+            return flusher_started_.load(std::memory_order_acquire);
         }
 
     private:
@@ -209,12 +219,9 @@ namespace usub::ulog
               , json_mode_(json_mode)
               , track_metrics_(track_metrics)
               , shutting_down_(false)
-              , queue_(queue_capacity_pow2)
+              , queue_(std::size_t{1} << queue_capacity_pow2)
         {
-            for (size_t i = 0; i < LEVEL_COUNT; ++i)
-            {
-                sinks_[i] = sinks_init[i];
-            }
+            for (size_t i = 0; i < LEVEL_COUNT; ++i) sinks_[i] = sinks_init[i];
             metric_overflow_pushes_.store(0, std::memory_order_relaxed);
             metric_backpressure_spins_.store(0, std::memory_order_relaxed);
         }
@@ -225,40 +232,28 @@ namespace usub::ulog
         static inline uint64_t now_ms_wallclock() noexcept
         {
             using namespace std::chrono;
-            return duration_cast<milliseconds>(
-                system_clock::now().time_since_epoch()
-            ).count();
+            return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
         }
 
         static inline uint32_t get_thread_id_fast() noexcept
         {
             static thread_local uint32_t tls_thread_id_cache = 0;
-
-            if (tls_thread_id_cache != 0)
-                return tls_thread_id_cache;
+            if (tls_thread_id_cache != 0) return tls_thread_id_cache;
 
             uint32_t rt = uvent::system::this_thread::detail::t_id;
-
-            bool valid =
-                (rt != 0u) &&
-                (rt != 0xFFFFFFFFu);
-
+            bool valid = (rt != 0u) && (rt != 0xFFFFFFFFu);
             if (!valid)
             {
                 rt = (uint32_t)((reinterpret_cast<uintptr_t>(&tls_thread_id_cache)) & 0xFFFFu);
                 if (rt == 0u) rt = 1u;
             }
-
             tls_thread_id_cache = rt;
             return rt;
         }
 
-        static inline size_t build_timestamp_string(uint64_t ts_ms,
-                                                    char* out,
-                                                    size_t cap) noexcept
+        static inline size_t build_timestamp_string(uint64_t ts_ms, char* out, size_t cap) noexcept
         {
-            if (cap < 24)
-                return 0;
+            if (cap < 24) return 0;
 
             time_t sec = (time_t)(ts_ms / 1000);
             uint32_t msec = (uint32_t)(ts_ms % 1000);
@@ -305,9 +300,7 @@ namespace usub::ulog
             return 23;
         }
 
-        static inline std::size_t format_prefix_plain(const LogEntry& e,
-                                                      char* out,
-                                                      std::size_t cap) noexcept
+        static inline std::size_t format_prefix_plain(const LogEntry& e, char* out, std::size_t cap) noexcept
         {
             if (cap == 0) return 0;
 
@@ -326,8 +319,7 @@ namespace usub::ulog
                 while (v != 0 && n < sizeof(tmp))
                 {
                     uint64_t q = v / 10;
-                    uint64_t d = v - q * 10;
-                    tmp[n++] = char('0' + d);
+                    tmp[n++] = char('0' + (v - q * 10));
                     v = q;
                 }
                 std::size_t w = 0;
@@ -343,8 +335,7 @@ namespace usub::ulog
 
             if (off < cap) out[off++] = '[';
             {
-                std::size_t cp = tslen;
-                if (cp > cap - off) cp = cap - off;
+                std::size_t cp = std::min(tslen, cap - off);
                 if (cp)
                 {
                     ::memcpy(out + off, tsbuf, cp);
@@ -360,8 +351,7 @@ namespace usub::ulog
             if (off < cap) out[off++] = '[';
             {
                 const char* lvlc = level_name(e.level);
-                if (lvlc && lvlc[0] && off < cap)
-                    out[off++] = lvlc[0];
+                if (lvlc && lvlc[0] && off < cap) out[off++] = lvlc[0];
             }
             if (off < cap) out[off++] = ']';
             if (off < cap) out[off++] = ' ';
@@ -370,10 +360,7 @@ namespace usub::ulog
             return off;
         }
 
-        static inline void color_codes_for(Level lvl,
-                                           const char*& start,
-                                           const char*& end,
-                                           bool enabled) noexcept
+        static inline void color_codes_for(Level lvl, const char*& start, const char*& end, bool enabled) noexcept
         {
             static const AnsiColors c{};
             if (!enabled)
@@ -385,25 +372,20 @@ namespace usub::ulog
 
             switch (lvl)
             {
-            case Level::Trace:
-                start = c.trace_prefix;
+            case Level::Trace: start = c.trace_prefix;
                 end = c.reset;
                 break;
-            case Level::Debug:
-                start = c.debug_prefix;
+            case Level::Debug: start = c.debug_prefix;
                 end = c.reset;
                 break;
-            case Level::Info:
-                start = c.info_prefix;
+            case Level::Info: start = c.info_prefix;
                 end = c.reset;
                 break;
-            case Level::Warn:
-                start = c.warn_prefix;
+            case Level::Warn: start = c.warn_prefix;
                 end = c.reset;
                 break;
             default:
-            case Level::Error:
-                start = c.error_prefix;
+            case Level::Error: start = c.error_prefix;
                 end = c.reset;
                 break;
             }
@@ -412,10 +394,7 @@ namespace usub::ulog
         template <typename T>
         static inline void append_one(std::string& out, const T& v) noexcept
         {
-            if constexpr (std::is_same_v<T, std::string>)
-            {
-                out.append(v);
-            }
+            if constexpr (std::is_same_v<T, std::string>) out.append(v);
             else if constexpr (std::is_convertible_v<T, std::string_view>)
             {
                 std::string_view sv(v);
@@ -423,35 +402,28 @@ namespace usub::ulog
             }
             else if constexpr (std::is_integral_v<T>)
             {
-                char buf[64];
-                int n = ::snprintf(buf, sizeof(buf), "%lld", (long long)v);
-                if (n > 0) out.append(buf, (size_t)n);
+                char b[64];
+                int n = ::snprintf(b, sizeof(b), "%lld", (long long)v);
+                if (n > 0) out.append(b, (size_t)n);
             }
             else if constexpr (std::is_floating_point_v<T>)
             {
-                char buf[64];
-                int n = ::snprintf(buf, sizeof(buf), "%g", (double)v);
-                if (n > 0) out.append(buf, (size_t)n);
+                char b[64];
+                int n = ::snprintf(b, sizeof(b), "%g", (double)v);
+                if (n > 0) out.append(b, (size_t)n);
             }
             else
             {
-                char buf[64];
-                int n = ::snprintf(buf, sizeof(buf), "%p", (const void*)&v);
-                if (n > 0) out.append(buf, (size_t)n);
+                char b[64];
+                int n = ::snprintf(b, sizeof(b), "%p", (const void*)&v);
+                if (n > 0) out.append(b, (size_t)n);
             }
         }
 
-        static inline void fmt_build(std::string& out,
-                                     std::string_view fmt) noexcept
-        {
-            out.append(fmt);
-        }
+        static inline void fmt_build(std::string& out, std::string_view fmt) noexcept { out.append(fmt); }
 
         template <typename Arg, typename... Rest>
-        static inline void fmt_build(std::string& out,
-                                     std::string_view fmt,
-                                     Arg&& a,
-                                     Rest&&... rest) noexcept
+        static inline void fmt_build(std::string& out, std::string_view fmt, Arg&& a, Rest&&... rest) noexcept
         {
             size_t p = fmt.find("{}");
             if (p == std::string_view::npos)
@@ -459,26 +431,18 @@ namespace usub::ulog
                 out.append(fmt);
                 return;
             }
-
             out.append(fmt.substr(0, p));
             append_one(out, a);
-
             fmt_build(out, fmt.substr(p + 2), std::forward<Rest>(rest)...);
         }
 
-        static inline uint16_t utf8_safe_size(const char* data,
-                                              size_t len,
-                                              size_t max_bytes)
+        static inline uint16_t utf8_safe_size(const char* data, size_t len, size_t max_bytes)
         {
-            if (len <= max_bytes)
-                return (uint16_t)len;
-
-            size_t i = max_bytes;
-            // walk back while we're on a UTF-8 continuation byte: 10xxxxxx
-            while (i > 0 && ((unsigned char)data[i] & 0xC0) == 0x80)
-                --i;
-
-            return (uint16_t)i;
+            size_t i = std::min(len, max_bytes);
+            if (i == 0) return 0;
+            i--;
+            while (i > 0 && (static_cast<unsigned char>(data[i]) & 0xC0) == 0x80) --i;
+            return static_cast<uint16_t>(i + 1);
         }
 
         template <std::size_t N>
@@ -491,10 +455,7 @@ namespace usub::ulog
             inline bool try_push(const LogEntry& e) noexcept
             {
                 uint16_t next = uint16_t((tail + 1) % N);
-                if (next == head)
-                {
-                    return false;
-                }
+                if (next == head) return false;
                 buf[tail] = e;
                 tail = next;
                 return true;
@@ -502,24 +463,13 @@ namespace usub::ulog
 
             inline bool try_pop(LogEntry& out) noexcept
             {
-                if (head == tail)
-                {
-                    return false;
-                }
+                if (head == tail) return false;
                 out = buf[head];
                 head = uint16_t((head + 1) % N);
                 return true;
             }
 
-            inline void rollback_last_pop() noexcept
-            {
-                head = uint16_t((head + 65535u) % N);
-            }
-
-            inline void overwrite_last_rollback(const LogEntry& e) noexcept
-            {
-                buf[head] = e;
-            }
+            inline void rollback_last_pop() noexcept { head = static_cast<uint16_t>((head + N - 1) % N); }
         };
 
         template <std::size_t N>
@@ -532,7 +482,6 @@ namespace usub::ulog
                 if (!q.try_enqueue(tmp))
                 {
                     overflow.rollback_last_pop();
-                    overflow.overwrite_last_rollback(tmp);
                     break;
                 }
             }
@@ -542,7 +491,7 @@ namespace usub::ulog
         static void rotate_files(const char* path, uint32_t max_files) noexcept;
 
     private:
-        static inline Logger* global_ = nullptr;
+        static inline std::atomic<Logger*> global_{nullptr};
 
         Sink sinks_[LEVEL_COUNT];
 
@@ -553,6 +502,7 @@ namespace usub::ulog
         bool json_mode_;
         bool track_metrics_;
         std::atomic<bool> shutting_down_;
+        std::atomic<bool> flusher_started_{false};
         std::atomic<uint64_t> metric_overflow_pushes_{0};
         std::atomic<uint64_t> metric_backpressure_spins_{0};
         queue::concurrent::MPMCQueue<LogEntry> queue_;

@@ -34,11 +34,11 @@ uvent::task::Awaitable<void> fake_worker(int id)
 int main()
 {
     usub::ulog::ULogInit cfg{
-        .trace_path = "./trace.log",
-        .debug_path = "./debug.log",
-        .info_path = "./info.log",
-        .warn_path = "./warn.log",
-        .error_path = "./error.log",
+        .trace_path = nullptr,
+        .debug_path = nullptr,
+        .info_path = nullptr,
+        .warn_path = nullptr,
+        .error_path = nullptr,
         .flush_interval_ns = 2'000'000ULL, // 2ms
         .queue_capacity_pow2 = 14, // 2^14 = 16384
         .batch_size = 512,

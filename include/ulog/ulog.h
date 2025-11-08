@@ -50,4 +50,4 @@ namespace usub::ulog
     }
 }
 
-#endif
+#endif // ULOG_H
