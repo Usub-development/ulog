@@ -55,10 +55,10 @@ set_target_properties(ulog PROPERTIES
 
 option(ULOG_BUILD_EXAMPLES "Build ulog example executables" ON)
 if (ULOG_BUILD_EXAMPLES)
-        add_executable(ulog_example examples/main.cpp)
-        target_link_libraries(ulog_example PRIVATE ulog)
-        target_compile_definitions(ulog_example PRIVATE DEV_STAGE=${DEV_STAGE})
-endif()
+    add_executable(ulog_example examples/main.cpp)
+    target_link_libraries(ulog_example PRIVATE ulog)
+    target_compile_definitions(ulog_example PRIVATE DEV_STAGE=${DEV_STAGE})
+endif ()
 
 install(TARGETS ulog
         EXPORT ulogTargets
