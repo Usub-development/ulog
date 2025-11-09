@@ -40,7 +40,7 @@ int main()
         .warn_path = nullptr,
         .error_path = nullptr,
         .flush_interval_ns = 2'000'000ULL, // 2ms
-        .queue_capacity_pow2 = 14, // 2^14 = 16384
+        .queue_capacity = 14, // 2^14 = 16384
         .batch_size = 512,
         .enable_color_stdout = true,
         .max_file_size_bytes = 10 * 1024 * 1024, // rotate at 10MB

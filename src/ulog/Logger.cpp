@@ -20,32 +20,40 @@ namespace usub::ulog
     void Logger::rotate_files(const char* path, uint32_t max_files) noexcept
     {
         if (!path || max_files == 0) return;
+
+        auto make_name = [&](uint32_t idx)
+        {
+            std::string s;
+            s.reserve(std::strlen(path) + 16);
+            s.append(path);
+            s.push_back('.');
+            char buf[32];
+            int n = ::snprintf(buf, sizeof(buf), "%u", idx);
+            if (n > 0) s.append(buf, (size_t)n);
+            return s;
+        };
+
         if (max_files == 1)
         {
-            char dst[512];
-            ::snprintf(dst, sizeof(dst), "%s.%u", path, 1u);
-            ::unlink(dst);
-            ::rename(path, dst);
+            auto dst = make_name(1);
+            ::unlink(dst.c_str());
+            ::rename(path, dst.c_str());
             return;
         }
 
         {
-            char oldname[512];
-            ::snprintf(oldname, sizeof(oldname), "%s.%u", path, max_files - 1);
-            ::unlink(oldname);
+            auto oldname = make_name(max_files - 1);
+            ::unlink(oldname.c_str());
         }
         for (int i = (int)max_files - 2; i >= 1; --i)
         {
-            char src[512];
-            char dst[512];
-            ::snprintf(src, sizeof(src), "%s.%d", path, i);
-            ::snprintf(dst, sizeof(dst), "%s.%d", path, i + 1);
-            ::rename(src, dst);
+            auto src = make_name((uint32_t)i);
+            auto dst = make_name((uint32_t)(i + 1));
+            ::rename(src.c_str(), dst.c_str());
         }
         {
-            char dst[512];
-            ::snprintf(dst, sizeof(dst), "%s.%u", path, 1u);
-            ::rename(path, dst);
+            auto dst = make_name(1);
+            ::rename(path, dst.c_str());
         }
     }
 
@@ -86,8 +94,7 @@ namespace usub::ulog
             base_fd = tmp;
         }
 
-        Sink local_sinks[LEVEL_COUNT];
-
+        std::vector<Sink> local_sinks_vec(LEVEL_COUNT);
         auto init_sink = [&](Level lvl, const char* path)
         {
             Sink s{};
@@ -95,7 +102,7 @@ namespace usub::ulog
             s.path = path;
             s.bytes_written = 0;
             s.color_enabled = cfg.enable_color_stdout && ::isatty(s.fd);
-            local_sinks[(size_t)lvl] = s;
+            local_sinks_vec[(size_t)lvl] = s;
         };
 
         init_sink(Level::Trace, cfg.trace_path);
@@ -106,9 +113,12 @@ namespace usub::ulog
 
         std::size_t bs = cfg.batch_size ? std::min<std::size_t>(cfg.batch_size, 4096) : 1;
 
+        Logger::Sink local_sinks_arr[LEVEL_COUNT];
+        for (size_t i = 0; i < LEVEL_COUNT; ++i) local_sinks_arr[i] = local_sinks_vec[i];
+
         Logger* lg = new Logger(
-            local_sinks,
-            cfg.queue_capacity_pow2,
+            local_sinks_arr,
+            cfg.queue_capacity,
             bs,
             cfg.flush_interval_ns,
             cfg.max_file_size_bytes,
@@ -157,108 +167,195 @@ namespace usub::ulog
                 seen[seen_n++] = fd;
             }
         }
-        // опционально не удаляем g для безопасности поздних логов
+    }
+
+    Logger::Logger(Sink sinks_init[LEVEL_COUNT],
+                   std::size_t queue_capacity,
+                   std::size_t batch_size,
+                   uint64_t flush_interval_ns,
+                   std::size_t max_file_size_bytes,
+                   uint32_t max_files,
+                   bool json_mode,
+                   bool track_metrics) noexcept
+        : batch_size_(batch_size)
+          , flush_interval_ns_(flush_interval_ns)
+          , max_file_size_bytes_(max_file_size_bytes)
+          , max_files_(max_files)
+          , json_mode_(json_mode)
+          , track_metrics_(track_metrics)
+          , shutting_down_(false)
+          , queue_(queue_capacity)
+    {
+        for (size_t i = 0; i < LEVEL_COUNT; ++i) sinks_[i] = sinks_init[i];
+        metric_overflow_pushes_.store(0, std::memory_order_relaxed);
+        metric_backpressure_spins_.store(0, std::memory_order_relaxed);
+    }
+
+    std::string Logger::build_timestamp_string(uint64_t ts_ms)
+    {
+        time_t sec = (time_t)(ts_ms / 1000);
+        uint32_t msec = (uint32_t)(ts_ms % 1000);
+
+        struct tm tmbuf;
+        struct tm* tm_ptr = ::localtime_r(&sec, &tmbuf);
+
+        int year = tm_ptr ? (tm_ptr->tm_year + 1900) : 0;
+        int mon = tm_ptr ? (tm_ptr->tm_mon + 1) : 0;
+        int day = tm_ptr ? tm_ptr->tm_mday : 0;
+        int hr = tm_ptr ? tm_ptr->tm_hour : 0;
+        int min = tm_ptr ? tm_ptr->tm_min : 0;
+        int sec2 = tm_ptr ? tm_ptr->tm_sec : 0;
+
+        auto two = [](int v)
+        {
+            std::string s;
+            s.resize(2);
+            s[0] = char('0' + (v / 10) % 10);
+            s[1] = char('0' + (v % 10));
+            return s;
+        };
+        auto thr = [](int v)
+        {
+            std::string s;
+            s.resize(3);
+            s[0] = char('0' + (v / 100) % 10);
+            s[1] = char('0' + (v / 10) % 10);
+            s[2] = char('0' + (v % 10));
+            return s;
+        };
+
+        std::string out;
+        out.reserve(23);
+        out.append({
+            char('0' + (year / 1000) % 10), char('0' + (year / 100) % 10), char('0' + (year / 10) % 10),
+            char('0' + (year % 10))
+        });
+        out.push_back('-');
+        out += two(mon);
+        out.push_back('-');
+        out += two(day);
+        out.push_back(' ');
+        out += two(hr);
+        out.push_back(':');
+        out += two(min);
+        out.push_back(':');
+        out += two(sec2);
+        out.push_back('.');
+        out += thr((int)msec);
+        return out;
+    }
+
+    std::string Logger::format_prefix_plain(const LogEntry& e)
+    {
+        std::string out;
+        std::string ts = build_timestamp_string(e.ts_ms);
+
+        auto u64_to_str = [](uint64_t v)
+        {
+            char buf[32];
+            int n = ::snprintf(buf, sizeof(buf), "%llu", (unsigned long long)v);
+            return std::string(buf, n > 0 ? (size_t)n : 0);
+        };
+
+        out.reserve(1 + ts.size() + 1 + 1 + 10 + 1 + 3 + 2);
+        out.push_back('[');
+        out += ts;
+        out.push_back(']');
+        out.push_back('[');
+        out += u64_to_str(e.thread_id);
+        out.push_back(']');
+        out.push_back('[');
+        out.push_back(level_name(e.level)[0]);
+        out.push_back(']');
+        out.push_back(' ');
+        return out;
+    }
+
+    void Logger::color_codes_for(Level lvl, const char*& start, const char*& end, bool enabled) noexcept
+    {
+        static const AnsiColors c{};
+        if (!enabled)
+        {
+            start = "";
+            end = "";
+            return;
+        }
+        switch (lvl)
+        {
+        case Level::Trace: start = c.trace_prefix;
+            end = c.reset;
+            break;
+        case Level::Debug: start = c.debug_prefix;
+            end = c.reset;
+            break;
+        case Level::Info: start = c.info_prefix;
+            end = c.reset;
+            break;
+        case Level::Warn: start = c.warn_prefix;
+            end = c.reset;
+            break;
+        default:
+        case Level::Error: start = c.error_prefix;
+            end = c.reset;
+            break;
+        }
     }
 
     void Logger::flush_once_batch() noexcept
     {
         const std::size_t limit = batch_size_;
-
-        static thread_local LogEntry tmp[4096];
-        std::size_t n = queue_.try_dequeue_bulk(tmp, limit);
+        std::unique_ptr<LogEntry[]> tmp(new LogEntry[limit]);
+        std::size_t n = queue_.try_dequeue_bulk(tmp.get(), limit);
         if (n == 0) return;
 
-        struct PerLevelBuf
-        {
-            char buf[128 * 1024];
-            size_t off = 0;
-        };
-        static thread_local PerLevelBuf bufs[LEVEL_COUNT];
-        for (size_t i = 0; i < LEVEL_COUNT; ++i) bufs[i].off = 0;
+        std::vector<std::string> bufs(LEVEL_COUNT);
 
-        auto text_mode_emit = [&](PerLevelBuf& lb, const LogEntry& e, bool color_enabled)
+        auto text_mode_emit = [&](std::string& lb, const LogEntry& e, bool color_enabled)
         {
             const char* c_begin;
             const char* c_end;
             color_codes_for(e.level, c_begin, c_end, color_enabled);
 
-            auto append_bytes = [&](const char* data, size_t len)
-            {
-                if (!len) return;
-                if (lb.off + len >= sizeof(lb.buf)) return;
-                ::memcpy(lb.buf + lb.off, data, len);
-                lb.off += len;
-            };
-
-            append_bytes(c_begin, ::strlen(c_begin));
-
-            char prefix[160];
-            size_t pref_len = format_prefix_plain(e, prefix, sizeof(prefix));
-            append_bytes(prefix, pref_len);
-
-            size_t msg_len = e.size;
-            if (msg_len > sizeof(e.msg)) msg_len = sizeof(e.msg);
-            append_bytes(e.msg, msg_len);
-            append_bytes("\n", 1);
-
-            append_bytes(c_end, ::strlen(c_end));
+            lb.append(c_begin);
+            lb += format_prefix_plain(e);
+            lb.append(e.msg);
+            lb.push_back('\n');
+            lb.append(c_end);
         };
 
-        auto json_mode_emit = [&](PerLevelBuf& lb, const LogEntry& e)
+        auto json_mode_emit = [&](std::string& lb, const LogEntry& e)
         {
-            char tsbuf[32];
-            size_t tslen = build_timestamp_string(e.ts_ms, tsbuf, sizeof(tsbuf));
-            char line[8192];
-            size_t w = 0;
+            std::string ts = build_timestamp_string(e.ts_ms);
+            std::string line;
+            line.reserve(64 + ts.size() + e.msg.size());
 
-            auto put = [&](const char* s, size_t len)
-            {
-                if (!len) return;
-                size_t room = sizeof(line) - w;
-                if (!room) return;
-                if (len > room) len = room;
-                ::memcpy(line + w, s, len);
-                w += len;
-            };
-            auto put_ch = [&](char c) { if (w < sizeof(line)) line[w++] = c; };
-
-            put("{\"time\":\"", 9);
-            put(tsbuf, tslen);
-            put("\",\"thread\":", 12);
+            line.append("{\"time\":\"");
+            line.append(ts);
+            line.append("\",\"thread\":");
             {
                 char tidbuf[32];
                 int tidn = ::snprintf(tidbuf, sizeof(tidbuf), "%u", e.thread_id);
-                if (tidn > 0) put(tidbuf, (size_t)tidn);
+                if (tidn > 0) line.append(tidbuf, (size_t)tidn);
             }
-            put(",\"level\":\"", 11);
-            {
-                const char* lvlc = level_name(e.level);
-                put(lvlc, 1);
-            }
-            put("\",\"msg\":\"", 10);
+            line.append(",\"level\":\"");
+            line.push_back(level_name(e.level)[0]);
+            line.append("\",\"msg\":\"");
 
-            size_t msg_len = e.size;
-            if (msg_len > sizeof(e.msg)) msg_len = sizeof(e.msg);
-            for (size_t k = 0; k < msg_len; ++k)
+            for (unsigned char c : e.msg)
             {
-                unsigned char c = (unsigned char)e.msg[k];
                 if (c == '"' || c == '\\')
                 {
-                    put("\\", 1);
-                    put((const char*)&c, 1);
+                    line.push_back('\\');
+                    line.push_back((char)c);
                 }
-                else if (c == '\n') put("\\n", 2);
-                else if (c == '\r') put("\\r", 2);
-                else if (c == '\t') put("\\t", 2);
-                else put((const char*)&c, 1);
+                else if (c == '\n') line.append("\\n");
+                else if (c == '\r') line.append("\\r");
+                else if (c == '\t') line.append("\\t");
+                else line.push_back((char)c);
             }
-            put("\"}\n", 3);
+            line.append("\"}\n");
 
-            if (lb.off + w < sizeof(lb.buf))
-            {
-                ::memcpy(lb.buf + lb.off, line, w);
-                lb.off += w;
-            }
+            lb.append(line);
         };
 
         for (std::size_t i = 0; i < n; ++i)
@@ -271,13 +368,13 @@ namespace usub::ulog
 
         for (size_t i = 0; i < LEVEL_COUNT; ++i)
         {
-            PerLevelBuf& lb = bufs[i];
-            if (lb.off == 0) continue;
+            std::string& lb = bufs[i];
+            if (lb.empty()) continue;
 
-            maybe_rotate_sink(i, lb.off);
+            maybe_rotate_sink(i, lb.size());
 
             Sink& s = sinks_[i];
-            ssize_t wr = ::write(s.fd, lb.buf, lb.off);
+            ssize_t wr = ::write(s.fd, lb.data(), lb.size());
             if (wr > 0) s.bytes_written += (size_t)wr;
         }
     }

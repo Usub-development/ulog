@@ -12,6 +12,7 @@
 #include <ctime>
 #include <string>
 #include <string_view>
+#include <vector>
 #include <algorithm>
 
 #include "uvent/utils/intrinsincs/optimizations.h"
@@ -51,11 +52,10 @@ namespace usub::ulog
 
     struct LogEntry
     {
-        uint64_t ts_ms;
-        uint32_t thread_id;
-        Level level;
-        uint16_t size;
-        char msg[4096];
+        uint64_t ts_ms{};
+        uint32_t thread_id{};
+        Level level{};
+        std::string msg;
     };
 
     struct ULogInit
@@ -66,7 +66,7 @@ namespace usub::ulog
         const char* warn_path = nullptr;
         const char* error_path = nullptr;
         uint64_t flush_interval_ns = 2'000'000ULL;
-        std::size_t queue_capacity_pow2 = 14;
+        std::size_t queue_capacity = 16384; // 2 ^ 14
         std::size_t batch_size = 512;
         bool enable_color_stdout = true;
         std::size_t max_file_size_bytes = 0;
@@ -84,9 +84,9 @@ namespace usub::ulog
         static inline Logger& instance() noexcept { return *global_.load(std::memory_order_acquire); }
         static inline Logger* try_instance() noexcept { return global_.load(std::memory_order_acquire); }
 
-        static inline void enqueue_with_overflow(Level lvl,
-                                                 const char* msg_data,
-                                                 uint16_t msg_len) noexcept
+        static constexpr std::size_t kMaxLogLineBytes = 64 * 1024;
+
+        static inline void enqueue_with_overflow(Level lvl, const char* msg_data, uint32_t msg_len) noexcept
         {
             Logger* lg = try_instance();
             if (!lg) return;
@@ -99,11 +99,8 @@ namespace usub::ulog
             entry.thread_id = get_thread_id_fast();
             entry.level = lvl;
 
-            uint16_t safe_len = msg_len;
-            if (safe_len >= sizeof(entry.msg)) safe_len = sizeof(entry.msg) - 1;
-            if (safe_len) ::memcpy(entry.msg, msg_data, safe_len);
-            entry.msg[safe_len] = '\0';
-            entry.size = safe_len;
+            const uint32_t safe_len = utf8_safe_size(msg_data, msg_len, kMaxLogLineBytes);
+            entry.msg.assign(msg_data, msg_data + safe_len);
 
             Logger& log = *lg;
             auto overflow_non_empty = [](const auto& r) noexcept { return r.head != r.tail; };
@@ -112,7 +109,6 @@ namespace usub::ulog
             {
                 if (overflow_non_empty(overflow) && !log.is_shutting_down())
                     try_drain_overflow(overflow, log.queue_);
-
                 if (!log.flusher_running()) log.flush_once_batch();
                 return;
             }
@@ -143,27 +139,32 @@ namespace usub::ulog
             std::string msg;
             msg.reserve(512);
             fmt_build(msg, fmt, std::forward<Args>(args)...);
-
-            uint16_t len = utf8_safe_size(msg.data(), msg.size(), sizeof(LogEntry::msg) - 1);
+            const uint32_t len = utf8_safe_size(msg.data(), msg.size(), kMaxLogLineBytes);
             enqueue_with_overflow(lvl, msg.data(), len);
         }
 
         static inline void push(Level lvl, const char* fmt, ...) noexcept
         {
-            char local_buf[4096];
-
+            std::vector<char> buf(256);
             va_list ap;
             va_start(ap, fmt);
-            int written = ::vsnprintf(local_buf, sizeof(local_buf), fmt, ap);
+            for (;;)
+            {
+                va_list ap2;
+                va_copy(ap2, ap);
+                int needed = ::vsnprintf(buf.data(), buf.size(), fmt, ap2);
+                va_end(ap2);
+                if (needed < 0)
+                {
+                    va_end(ap);
+                    return;
+                }
+                if (static_cast<size_t>(needed) < buf.size()) break;
+                buf.resize(static_cast<size_t>(needed) + 1);
+            }
             va_end(ap);
-
-            uint16_t len;
-            if (written <= 0) len = 0;
-            else if ((std::size_t)written >= sizeof(local_buf)) len = (uint16_t)(sizeof(local_buf) - 1);
-            else len = (uint16_t)written;
-
-            len = utf8_safe_size(local_buf, len, sizeof(LogEntry::msg) - 1);
-            enqueue_with_overflow(lvl, local_buf, len);
+            const uint32_t len = utf8_safe_size(buf.data(), std::strlen(buf.data()), kMaxLogLineBytes);
+            enqueue_with_overflow(lvl, buf.data(), len);
         }
 
         void flush_once_batch() noexcept;
@@ -180,51 +181,27 @@ namespace usub::ulog
             return metric_backpressure_spins_.load(std::memory_order_relaxed);
         }
 
-        inline bool is_shutting_down() const noexcept
-        {
-            return shutting_down_.load(std::memory_order_acquire);
-        }
-
-        inline void mark_flusher_started() noexcept
-        {
-            flusher_started_.store(true, std::memory_order_release);
-        }
-
-        inline bool flusher_running() const noexcept
-        {
-            return flusher_started_.load(std::memory_order_acquire);
-        }
+        inline bool is_shutting_down() const noexcept { return shutting_down_.load(std::memory_order_acquire); }
+        inline void mark_flusher_started() noexcept { flusher_started_.store(true, std::memory_order_release); }
+        inline bool flusher_running() const noexcept { return flusher_started_.load(std::memory_order_acquire); }
 
     private:
         struct Sink
         {
-            int fd;
-            const char* path;
-            size_t bytes_written;
-            bool color_enabled;
+            int fd{};
+            const char* path{};
+            size_t bytes_written{};
+            bool color_enabled{};
         };
 
         Logger(Sink sinks_init[LEVEL_COUNT],
-               std::size_t queue_capacity_pow2,
+               std::size_t queue_capacity,
                std::size_t batch_size,
                uint64_t flush_interval_ns,
                std::size_t max_file_size_bytes,
                uint32_t max_files,
                bool json_mode,
-               bool track_metrics) noexcept
-            : batch_size_(batch_size)
-              , flush_interval_ns_(flush_interval_ns)
-              , max_file_size_bytes_(max_file_size_bytes)
-              , max_files_(max_files)
-              , json_mode_(json_mode)
-              , track_metrics_(track_metrics)
-              , shutting_down_(false)
-              , queue_(std::size_t{1} << queue_capacity_pow2)
-        {
-            for (size_t i = 0; i < LEVEL_COUNT; ++i) sinks_[i] = sinks_init[i];
-            metric_overflow_pushes_.store(0, std::memory_order_relaxed);
-            metric_backpressure_spins_.store(0, std::memory_order_relaxed);
-        }
+               bool track_metrics) noexcept;
 
         Logger(const Logger&) = delete;
         Logger& operator=(const Logger&) = delete;
@@ -239,7 +216,6 @@ namespace usub::ulog
         {
             static thread_local uint32_t tls_thread_id_cache = 0;
             if (tls_thread_id_cache != 0) return tls_thread_id_cache;
-
             uint32_t rt = uvent::system::this_thread::detail::t_id;
             bool valid = (rt != 0u) && (rt != 0xFFFFFFFFu);
             if (!valid)
@@ -251,145 +227,9 @@ namespace usub::ulog
             return rt;
         }
 
-        static inline size_t build_timestamp_string(uint64_t ts_ms, char* out, size_t cap) noexcept
-        {
-            if (cap < 24) return 0;
-
-            time_t sec = (time_t)(ts_ms / 1000);
-            uint32_t msec = (uint32_t)(ts_ms % 1000);
-
-            struct tm tmbuf;
-            struct tm* tm_ptr = ::localtime_r(&sec, &tmbuf);
-
-            auto u32_to_dec3 = [](uint32_t v, char* buf)
-            {
-                buf[0] = char('0' + (v / 100) % 10);
-                buf[1] = char('0' + (v / 10) % 10);
-                buf[2] = char('0' + (v % 10));
-            };
-            auto u32_to_dec2 = [](uint32_t v, char* buf)
-            {
-                buf[0] = char('0' + (v / 10) % 10);
-                buf[1] = char('0' + (v % 10));
-            };
-
-            int year = tm_ptr ? (tm_ptr->tm_year + 1900) : 0;
-            int mon = tm_ptr ? (tm_ptr->tm_mon + 1) : 0;
-            int day = tm_ptr ? tm_ptr->tm_mday : 0;
-            int hr = tm_ptr ? tm_ptr->tm_hour : 0;
-            int min = tm_ptr ? tm_ptr->tm_min : 0;
-            int sec2 = tm_ptr ? tm_ptr->tm_sec : 0;
-
-            out[0] = char('0' + (year / 1000) % 10);
-            out[1] = char('0' + (year / 100) % 10);
-            out[2] = char('0' + (year / 10) % 10);
-            out[3] = char('0' + (year % 10));
-            out[4] = '-';
-            u32_to_dec2((uint32_t)mon, &out[5]);
-            out[7] = '-';
-            u32_to_dec2((uint32_t)day, &out[8]);
-            out[10] = ' ';
-            u32_to_dec2((uint32_t)hr, &out[11]);
-            out[13] = ':';
-            u32_to_dec2((uint32_t)min, &out[14]);
-            out[16] = ':';
-            u32_to_dec2((uint32_t)sec2, &out[17]);
-            out[19] = '.';
-            u32_to_dec3(msec, &out[20]);
-
-            return 23;
-        }
-
-        static inline std::size_t format_prefix_plain(const LogEntry& e, char* out, std::size_t cap) noexcept
-        {
-            if (cap == 0) return 0;
-
-            char tsbuf[32];
-            size_t tslen = build_timestamp_string(e.ts_ms, tsbuf, sizeof(tsbuf));
-
-            auto u64_to_buf = [](uint64_t v, char* buf, std::size_t max) noexcept -> std::size_t
-            {
-                char tmp[32];
-                std::size_t n = 0;
-                if (v == 0)
-                {
-                    if (max > 0) buf[0] = '0';
-                    return 1;
-                }
-                while (v != 0 && n < sizeof(tmp))
-                {
-                    uint64_t q = v / 10;
-                    tmp[n++] = char('0' + (v - q * 10));
-                    v = q;
-                }
-                std::size_t w = 0;
-                while (w < n && w < max)
-                {
-                    buf[w] = tmp[n - 1 - w];
-                    ++w;
-                }
-                return w;
-            };
-
-            std::size_t off = 0;
-
-            if (off < cap) out[off++] = '[';
-            {
-                std::size_t cp = std::min(tslen, cap - off);
-                if (cp)
-                {
-                    ::memcpy(out + off, tsbuf, cp);
-                    off += cp;
-                }
-            }
-            if (off < cap) out[off++] = ']';
-
-            if (off < cap) out[off++] = '[';
-            off += u64_to_buf(e.thread_id, out + off, (off < cap ? cap - off : 0));
-            if (off < cap) out[off++] = ']';
-
-            if (off < cap) out[off++] = '[';
-            {
-                const char* lvlc = level_name(e.level);
-                if (lvlc && lvlc[0] && off < cap) out[off++] = lvlc[0];
-            }
-            if (off < cap) out[off++] = ']';
-            if (off < cap) out[off++] = ' ';
-
-            if (off > cap) off = cap;
-            return off;
-        }
-
-        static inline void color_codes_for(Level lvl, const char*& start, const char*& end, bool enabled) noexcept
-        {
-            static const AnsiColors c{};
-            if (!enabled)
-            {
-                start = "";
-                end = "";
-                return;
-            }
-
-            switch (lvl)
-            {
-            case Level::Trace: start = c.trace_prefix;
-                end = c.reset;
-                break;
-            case Level::Debug: start = c.debug_prefix;
-                end = c.reset;
-                break;
-            case Level::Info: start = c.info_prefix;
-                end = c.reset;
-                break;
-            case Level::Warn: start = c.warn_prefix;
-                end = c.reset;
-                break;
-            default:
-            case Level::Error: start = c.error_prefix;
-                end = c.reset;
-                break;
-            }
-        }
+        static std::string build_timestamp_string(uint64_t ts_ms);
+        static std::string format_prefix_plain(const LogEntry& e);
+        static void color_codes_for(Level lvl, const char*& start, const char*& end, bool enabled) noexcept;
 
         template <typename T>
         static inline void append_one(std::string& out, const T& v) noexcept
@@ -436,21 +276,25 @@ namespace usub::ulog
             fmt_build(out, fmt.substr(p + 2), std::forward<Rest>(rest)...);
         }
 
-        static inline uint16_t utf8_safe_size(const char* data, size_t len, size_t max_bytes)
+        static inline uint32_t utf8_safe_size(const char* data, size_t len, size_t max_bytes)
         {
             size_t i = std::min(len, max_bytes);
             if (i == 0) return 0;
             i--;
             while (i > 0 && (static_cast<unsigned char>(data[i]) & 0xC0) == 0x80) --i;
-            return static_cast<uint16_t>(i + 1);
+            return static_cast<uint32_t>(i + 1);
         }
 
         template <std::size_t N>
         struct ThreadOverflowRing
         {
-            LogEntry buf[N];
+            std::vector<LogEntry> buf;
             uint16_t head = 0;
             uint16_t tail = 0;
+
+            ThreadOverflowRing() : buf(N)
+            {
+            }
 
             inline bool try_push(const LogEntry& e) noexcept
             {
