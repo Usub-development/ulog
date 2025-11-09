@@ -164,7 +164,7 @@ namespace usub::ulog
     {
         const std::size_t limit = batch_size_;
 
-        static thread_local LogEntry tmp[4096];
+        static thread_local LogEntry tmp[128];
         std::size_t n = queue_.try_dequeue_bulk(tmp, limit);
         if (n == 0) return;
 
