@@ -110,6 +110,8 @@ namespace usub::ulog
         init_sink(Level::Info, cfg.info_path);
         init_sink(Level::Warn, cfg.warn_path);
         init_sink(Level::Error, cfg.error_path);
+        init_sink(Level::Critical, cfg.critical_path ? cfg.critical_path : cfg.error_path);
+        init_sink(Level::Fatal, cfg.fatal_path ? cfg.fatal_path : cfg.error_path);
 
         std::size_t bs = cfg.batch_size ? std::min<std::size_t>(cfg.batch_size, 4096) : 1;
 
@@ -282,21 +284,37 @@ namespace usub::ulog
         }
         switch (lvl)
         {
-        case Level::Trace: start = c.trace_prefix;
+        case Level::Trace:
+            start = c.trace_prefix;
             end = c.reset;
             break;
-        case Level::Debug: start = c.debug_prefix;
+        case Level::Debug:
+            start = c.debug_prefix;
             end = c.reset;
             break;
-        case Level::Info: start = c.info_prefix;
+        case Level::Info:
+            start = c.info_prefix;
             end = c.reset;
             break;
-        case Level::Warn: start = c.warn_prefix;
+        case Level::Warn:
+            start = c.warn_prefix;
+            end = c.reset;
+            break;
+        case Level::Error:
+            start = c.error_prefix;
+            end = c.reset;
+            break;
+        case Level::Critical:
+            start = c.critical_prefix;
+            end = c.reset;
+            break;
+        case Level::Fatal:
+            start = c.fatal_prefix;
             end = c.reset;
             break;
         default:
-        case Level::Error: start = c.error_prefix;
-            end = c.reset;
+            start = "";
+            end = "";
             break;
         }
     }

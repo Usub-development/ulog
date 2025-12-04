@@ -48,6 +48,18 @@ namespace usub::ulog
     {
         Logger::pushf(Level::Error, fmt, std::forward<Args>(args)...);
     }
+
+    template <typename... Args>
+    inline void critical(std::string_view fmt, Args&&... args) noexcept
+    {
+        Logger::pushf(Level::Critical, fmt, std::forward<Args>(args)...);
+    }
+
+    template <typename... Args>
+    inline void fatal(std::string_view fmt, Args&&... args) noexcept
+    {
+        Logger::pushf(Level::Fatal, fmt, std::forward<Args>(args)...);
+    }
 }
 
 #endif // ULOG_H

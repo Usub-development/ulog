@@ -23,31 +23,44 @@
 
 namespace usub::ulog
 {
-    enum class Level : uint8_t { Trace, Debug, Info, Warn, Error };
+    enum class Level : uint8_t
+    {
+        Trace,
+        Debug,
+        Info,
+        Warn,
+        Error,
+        Critical,
+        Fatal
+    };
 
-    static inline constexpr size_t LEVEL_COUNT = 5;
+    static inline constexpr size_t LEVEL_COUNT = 7;
 
     inline constexpr const char* level_name(Level lvl) noexcept
     {
         switch (lvl)
         {
-        case Level::Trace: return "T";
-        case Level::Debug: return "D";
-        case Level::Info: return "I";
-        case Level::Warn: return "W";
-        default:
-        case Level::Error: return "E";
+        case Level::Trace:    return "T";
+        case Level::Debug:    return "D";
+        case Level::Info:     return "I";
+        case Level::Warn:     return "W";
+        case Level::Error:    return "E";
+        case Level::Critical: return "C";
+        case Level::Fatal:    return "F";
+        default:              return "?";
         }
     }
 
     struct AnsiColors
     {
-        const char* trace_prefix = "\x1b[90m";
-        const char* debug_prefix = "\x1b[36m";
-        const char* info_prefix = "\x1b[32m";
-        const char* warn_prefix = "\x1b[33m";
-        const char* error_prefix = "\x1b[31m";
-        const char* reset = "\x1b[0m";
+        const char* trace_prefix    = "\x1b[90m";
+        const char* debug_prefix    = "\x1b[36m";
+        const char* info_prefix     = "\x1b[32m";
+        const char* warn_prefix     = "\x1b[33m";
+        const char* error_prefix    = "\x1b[31m";
+        const char* critical_prefix = "\x1b[91m"; // ярко-красный
+        const char* fatal_prefix    = "\x1b[95m"; // ярко-пурпурный
+        const char* reset           = "\x1b[0m";
     };
 
     struct LogEntry
@@ -65,6 +78,7 @@ namespace usub::ulog
         const char* info_path = nullptr;
         const char* warn_path = nullptr;
         const char* error_path = nullptr;
+
         uint64_t flush_interval_ns = 2'000'000ULL;
         std::size_t queue_capacity = 16384; // 2 ^ 14
         std::size_t batch_size = 512;
@@ -73,6 +87,10 @@ namespace usub::ulog
         uint32_t max_files = 3;
         bool json_mode = false;
         bool track_metrics = false;
+
+        // новые поля в конце — старые агрегатные инициализации не ломаем
+        const char* critical_path = nullptr;
+        const char* fatal_path = nullptr;
     };
 
     class Logger
