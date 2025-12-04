@@ -58,8 +58,8 @@ namespace usub::ulog
         const char* info_prefix     = "\x1b[32m";
         const char* warn_prefix     = "\x1b[33m";
         const char* error_prefix    = "\x1b[31m";
-        const char* critical_prefix = "\x1b[91m"; // ярко-красный
-        const char* fatal_prefix    = "\x1b[95m"; // ярко-пурпурный
+        const char* critical_prefix = "\x1b[91m";
+        const char* fatal_prefix    = "\x1b[95m";
         const char* reset           = "\x1b[0m";
     };
 
@@ -80,7 +80,7 @@ namespace usub::ulog
         const char* error_path = nullptr;
 
         uint64_t flush_interval_ns = 2'000'000ULL;
-        std::size_t queue_capacity = 16384; // 2 ^ 14
+        std::size_t queue_capacity = 16384;
         std::size_t batch_size = 512;
         bool enable_color_stdout = true;
         std::size_t max_file_size_bytes = 0;
@@ -88,7 +88,6 @@ namespace usub::ulog
         bool json_mode = false;
         bool track_metrics = false;
 
-        // новые поля в конце — старые агрегатные инициализации не ломаем
         const char* critical_path = nullptr;
         const char* fatal_path = nullptr;
     };
