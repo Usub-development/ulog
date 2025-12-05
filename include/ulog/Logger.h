@@ -40,27 +40,27 @@ namespace usub::ulog
     {
         switch (lvl)
         {
-        case Level::Trace:    return "T";
-        case Level::Debug:    return "D";
-        case Level::Info:     return "I";
-        case Level::Warn:     return "W";
-        case Level::Error:    return "E";
+        case Level::Trace: return "T";
+        case Level::Debug: return "D";
+        case Level::Info: return "I";
+        case Level::Warn: return "W";
+        case Level::Error: return "E";
         case Level::Critical: return "C";
-        case Level::Fatal:    return "F";
-        default:              return "?";
+        case Level::Fatal: return "F";
+        default: return "?";
         }
     }
 
     struct AnsiColors
     {
-        const char* trace_prefix    = "\x1b[90m";
-        const char* debug_prefix    = "\x1b[36m";
-        const char* info_prefix     = "\x1b[32m";
-        const char* warn_prefix     = "\x1b[33m";
-        const char* error_prefix    = "\x1b[31m";
+        const char* trace_prefix = "\x1b[90m";
+        const char* debug_prefix = "\x1b[36m";
+        const char* info_prefix = "\x1b[32m";
+        const char* warn_prefix = "\x1b[33m";
+        const char* error_prefix = "\x1b[31m";
         const char* critical_prefix = "\x1b[91m";
-        const char* fatal_prefix    = "\x1b[95m";
-        const char* reset           = "\x1b[0m";
+        const char* fatal_prefix = "\x1b[95m";
+        const char* reset = "\x1b[0m";
     };
 
     struct LogEntry
@@ -78,6 +78,8 @@ namespace usub::ulog
         const char* info_path = nullptr;
         const char* warn_path = nullptr;
         const char* error_path = nullptr;
+        const char* critical_path = nullptr;
+        const char* fatal_path = nullptr;
 
         uint64_t flush_interval_ns = 2'000'000ULL;
         std::size_t queue_capacity = 16384;
@@ -87,9 +89,7 @@ namespace usub::ulog
         uint32_t max_files = 3;
         bool json_mode = false;
         bool track_metrics = false;
-
-        const char* critical_path = nullptr;
-        const char* fatal_path = nullptr;
+        uint32_t max_backpressure_retries = 5;
     };
 
     class Logger
@@ -138,11 +138,29 @@ namespace usub::ulog
                 return;
             }
 
-            if (log.track_metrics_)
-                log.metric_backpressure_spins_.fetch_add(1, std::memory_order_relaxed);
+            bool enqueued = false;
+            const uint32_t retries = log.max_backpressure_retries_;
 
-            while (!log.queue_.try_enqueue(entry))
+            for (uint32_t attempt = 0; attempt < retries; ++attempt)
+            {
+                if (log.queue_.try_enqueue(entry))
+                {
+                    enqueued = true;
+                    break;
+                }
+
+                if (log.track_metrics_)
+                    log.metric_backpressure_spins_.fetch_add(1, std::memory_order_relaxed);
+
                 cpu_relax();
+            }
+
+            if (!enqueued)
+            {
+                if (log.track_metrics_)
+                    log.metric_backpressure_failures_.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
 
             if (overflow_non_empty(overflow) && !log.is_shutting_down())
                 try_drain_overflow(overflow, log.queue_);
@@ -198,6 +216,11 @@ namespace usub::ulog
             return metric_backpressure_spins_.load(std::memory_order_relaxed);
         }
 
+        inline uint64_t get_backpressure_failures() const noexcept
+        {
+            return metric_backpressure_failures_.load(std::memory_order_relaxed);
+        }
+
         inline bool is_shutting_down() const noexcept { return shutting_down_.load(std::memory_order_acquire); }
         inline void mark_flusher_started() noexcept { flusher_started_.store(true, std::memory_order_release); }
         inline bool flusher_running() const noexcept { return flusher_started_.load(std::memory_order_acquire); }
@@ -218,7 +241,8 @@ namespace usub::ulog
                std::size_t max_file_size_bytes,
                uint32_t max_files,
                bool json_mode,
-               bool track_metrics) noexcept;
+               bool track_metrics,
+               uint32_t max_backpressure_retries) noexcept;
 
         Logger(const Logger&) = delete;
         Logger& operator=(const Logger&) = delete;
@@ -362,10 +386,13 @@ namespace usub::ulog
         uint32_t max_files_;
         bool json_mode_;
         bool track_metrics_;
+        uint32_t max_backpressure_retries_;
+
         std::atomic<bool> shutting_down_;
         std::atomic<bool> flusher_started_{false};
         std::atomic<uint64_t> metric_overflow_pushes_{0};
         std::atomic<uint64_t> metric_backpressure_spins_{0};
+        std::atomic<uint64_t> metric_backpressure_failures_{0};
         queue::concurrent::MPMCQueue<LogEntry> queue_;
     };
 } // namespace usub::ulog

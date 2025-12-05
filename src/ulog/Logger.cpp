@@ -126,7 +126,8 @@ namespace usub::ulog
             cfg.max_file_size_bytes,
             cfg.max_files,
             cfg.json_mode,
-            cfg.track_metrics
+            cfg.track_metrics,
+            cfg.max_backpressure_retries
         );
 
         std::atomic_thread_fence(std::memory_order_release);
@@ -178,19 +179,22 @@ namespace usub::ulog
                    std::size_t max_file_size_bytes,
                    uint32_t max_files,
                    bool json_mode,
-                   bool track_metrics) noexcept
+                   bool track_metrics,
+                   uint32_t max_backpressure_retries) noexcept
         : batch_size_(batch_size)
           , flush_interval_ns_(flush_interval_ns)
           , max_file_size_bytes_(max_file_size_bytes)
           , max_files_(max_files)
           , json_mode_(json_mode)
           , track_metrics_(track_metrics)
+          , max_backpressure_retries_(max_backpressure_retries)
           , shutting_down_(false)
           , queue_(queue_capacity)
     {
         for (size_t i = 0; i < LEVEL_COUNT; ++i) sinks_[i] = sinks_init[i];
         metric_overflow_pushes_.store(0, std::memory_order_relaxed);
         metric_backpressure_spins_.store(0, std::memory_order_relaxed);
+        metric_backpressure_failures_.store(0, std::memory_order_relaxed);
     }
 
     std::string Logger::build_timestamp_string(uint64_t ts_ms)
@@ -229,7 +233,9 @@ namespace usub::ulog
         std::string out;
         out.reserve(23);
         out.append({
-            char('0' + (year / 1000) % 10), char('0' + (year / 100) % 10), char('0' + (year / 10) % 10),
+            char('0' + (year / 1000) % 10),
+            char('0' + (year / 100) % 10),
+            char('0' + (year / 10) % 10),
             char('0' + (year % 10))
         });
         out.push_back('-');
@@ -249,8 +255,8 @@ namespace usub::ulog
 
     std::string Logger::format_prefix_plain(const LogEntry& e)
     {
-        std::string out;
         std::string ts = build_timestamp_string(e.ts_ms);
+        std::string out;
 
         auto u64_to_str = [](uint64_t v)
         {
