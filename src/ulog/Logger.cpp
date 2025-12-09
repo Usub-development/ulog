@@ -89,7 +89,8 @@ namespace usub::ulog
         int base_fd = -1;
         {
             int tmp = -1;
-            if (cfg.info_path) tmp = ::open(cfg.info_path, O_CREAT | O_APPEND | O_WRONLY, 0644);
+            if (cfg.info_path)
+                tmp = ::open(cfg.info_path, O_CREAT | O_APPEND | O_WRONLY, 0644);
             if (tmp < 0) tmp = 1;
             base_fd = tmp;
         }
@@ -116,7 +117,8 @@ namespace usub::ulog
         std::size_t bs = cfg.batch_size ? std::min<std::size_t>(cfg.batch_size, 4096) : 1;
 
         Logger::Sink local_sinks_arr[LEVEL_COUNT];
-        for (size_t i = 0; i < LEVEL_COUNT; ++i) local_sinks_arr[i] = local_sinks_vec[i];
+        for (size_t i = 0; i < LEVEL_COUNT; ++i)
+            local_sinks_arr[i] = local_sinks_vec[i];
 
         Logger* lg = new Logger(
             local_sinks_arr,
@@ -126,8 +128,7 @@ namespace usub::ulog
             cfg.max_file_size_bytes,
             cfg.max_files,
             cfg.json_mode,
-            cfg.track_metrics,
-            cfg.max_backpressure_retries
+            cfg.track_metrics
         );
 
         std::atomic_thread_fence(std::memory_order_release);
@@ -144,7 +145,17 @@ namespace usub::ulog
         for (;;)
         {
             g->flush_once_batch();
-            if (g->queue_.empty()) break;
+
+            bool empty_mpmc = g->queue_.empty();
+            bool empty_fallback;
+            {
+                std::lock_guard<std::mutex> lk(g->fallback_mutex_);
+                empty_fallback = g->fallback_queue_.empty();
+            }
+
+            if (empty_mpmc && empty_fallback)
+                break;
+
             cpu_relax();
         }
 
@@ -170,6 +181,9 @@ namespace usub::ulog
                 seen[seen_n++] = fd;
             }
         }
+
+        global_.store(nullptr, std::memory_order_release);
+        delete g;
     }
 
     Logger::Logger(Sink sinks_init[LEVEL_COUNT],
@@ -179,22 +193,21 @@ namespace usub::ulog
                    std::size_t max_file_size_bytes,
                    uint32_t max_files,
                    bool json_mode,
-                   bool track_metrics,
-                   uint32_t max_backpressure_retries) noexcept
+                   bool track_metrics) noexcept
         : batch_size_(batch_size)
           , flush_interval_ns_(flush_interval_ns)
           , max_file_size_bytes_(max_file_size_bytes)
           , max_files_(max_files)
           , json_mode_(json_mode)
           , track_metrics_(track_metrics)
-          , max_backpressure_retries_(max_backpressure_retries)
           , shutting_down_(false)
           , queue_(queue_capacity)
+          , fallback_queue_(queue_capacity)
     {
-        for (size_t i = 0; i < LEVEL_COUNT; ++i) sinks_[i] = sinks_init[i];
-        metric_overflow_pushes_.store(0, std::memory_order_relaxed);
-        metric_backpressure_spins_.store(0, std::memory_order_relaxed);
-        metric_backpressure_failures_.store(0, std::memory_order_relaxed);
+        for (size_t i = 0; i < LEVEL_COUNT; ++i)
+            sinks_[i] = sinks_init[i];
+
+        metric_overflows_.store(0, std::memory_order_relaxed);
     }
 
     std::string Logger::build_timestamp_string(uint64_t ts_ms)
@@ -279,7 +292,10 @@ namespace usub::ulog
         return out;
     }
 
-    void Logger::color_codes_for(Level lvl, const char*& start, const char*& end, bool enabled) noexcept
+    void Logger::color_codes_for(Level lvl,
+                                 const char*& start,
+                                 const char*& end,
+                                 bool enabled) noexcept
     {
         static const AnsiColors c{};
         if (!enabled)
@@ -328,13 +344,27 @@ namespace usub::ulog
     void Logger::flush_once_batch() noexcept
     {
         const std::size_t limit = batch_size_;
+
         std::unique_ptr<LogEntry[]> tmp(new LogEntry[limit]);
+
         std::size_t n = queue_.try_dequeue_bulk(tmp.get(), limit);
+
+        if (n < limit)
+        {
+            std::lock_guard<std::mutex> lk(fallback_mutex_);
+            if (!fallback_queue_.empty())
+            {
+                n += fallback_queue_.dequeue_bulk(tmp.get() + n, limit - n);
+            }
+        }
+
         if (n == 0) return;
 
         std::vector<std::string> bufs(LEVEL_COUNT);
 
-        auto text_mode_emit = [&](std::string& lb, const LogEntry& e, bool color_enabled)
+        auto text_mode_emit = [&](std::string& lb,
+                                  const LogEntry& e,
+                                  bool color_enabled)
         {
             const char* c_begin;
             const char* c_end;
@@ -386,8 +416,10 @@ namespace usub::ulog
         {
             const LogEntry& e = tmp[i];
             size_t idx = (size_t)e.level;
-            if (!json_mode_) text_mode_emit(bufs[idx], e, sinks_[idx].color_enabled);
-            else json_mode_emit(bufs[idx], e);
+            if (!json_mode_)
+                text_mode_emit(bufs[idx], e, sinks_[idx].color_enabled);
+            else
+                json_mode_emit(bufs[idx], e);
         }
 
         for (size_t i = 0; i < LEVEL_COUNT; ++i)

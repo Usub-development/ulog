@@ -14,12 +14,14 @@
 #include <string_view>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 
 #include "uvent/utils/intrinsincs/optimizations.h"
 #include "uvent/base/Predefines.h"
 #include "uvent/utils/datastructures/DataStructuresMetadata.h"
 #include "uvent/system/SystemContext.h"
 #include "uvent/utils/datastructures/queue/ConcurrentQueues.h"
+#include "uvent/utils/datastructures/queue/FastQueue.h"
 
 namespace usub::ulog
 {
@@ -89,17 +91,28 @@ namespace usub::ulog
         uint32_t max_files = 3;
         bool json_mode = false;
         bool track_metrics = false;
-        uint32_t max_backpressure_retries = 5;
     };
 
     class Logger
     {
     public:
+        ~Logger()
+        {
+            std::cout << "dtor Logger" << std::endl;
+        }
+
         static void init_internal(const ULogInit& cfg) noexcept;
         static void shutdown_internal() noexcept;
 
-        static inline Logger& instance() noexcept { return *global_.load(std::memory_order_acquire); }
-        static inline Logger* try_instance() noexcept { return global_.load(std::memory_order_acquire); }
+        static inline Logger& instance() noexcept
+        {
+            return *global_.load(std::memory_order_acquire);
+        }
+
+        static inline Logger* try_instance() noexcept
+        {
+            return global_.load(std::memory_order_acquire);
+        }
 
         static constexpr std::size_t kMaxLogLineBytes = 64 * 1024;
 
@@ -109,8 +122,6 @@ namespace usub::ulog
             if (!lg) return;
             if (lg->is_shutting_down()) return;
 
-            thread_local ThreadOverflowRing<64> overflow;
-
             LogEntry entry{};
             entry.ts_ms = now_ms_wallclock();
             entry.thread_id = get_thread_id_fast();
@@ -119,53 +130,23 @@ namespace usub::ulog
             const uint32_t safe_len = utf8_safe_size(msg_data, msg_len, kMaxLogLineBytes);
             entry.msg.assign(msg_data, msg_data + safe_len);
 
-            Logger& log = *lg;
-            auto overflow_non_empty = [](const auto& r) noexcept { return r.head != r.tail; };
-
-            if (log.queue_.try_enqueue(entry))
+            if (lg->queue_.try_enqueue(entry))
             {
-                if (overflow_non_empty(overflow) && !log.is_shutting_down())
-                    try_drain_overflow(overflow, log.queue_);
-                if (!log.flusher_running()) log.flush_once_batch();
+                if (!lg->flusher_running())
+                    lg->flush_once_batch();
                 return;
             }
 
-            if (overflow.try_push(entry))
+            if (lg->track_metrics_)
+                lg->metric_overflows_.fetch_add(1, std::memory_order_relaxed);
+
             {
-                if (log.track_metrics_)
-                    log.metric_overflow_pushes_.fetch_add(1, std::memory_order_relaxed);
-                if (!log.flusher_running()) log.flush_once_batch();
-                return;
+                std::lock_guard<std::mutex> lk(lg->fallback_mutex_);
+                lg->fallback_queue_.enqueue(std::move(entry));
             }
 
-            bool enqueued = false;
-            const uint32_t retries = log.max_backpressure_retries_;
-
-            for (uint32_t attempt = 0; attempt < retries; ++attempt)
-            {
-                if (log.queue_.try_enqueue(entry))
-                {
-                    enqueued = true;
-                    break;
-                }
-
-                if (log.track_metrics_)
-                    log.metric_backpressure_spins_.fetch_add(1, std::memory_order_relaxed);
-
-                cpu_relax();
-            }
-
-            if (!enqueued)
-            {
-                if (log.track_metrics_)
-                    log.metric_backpressure_failures_.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-
-            if (overflow_non_empty(overflow) && !log.is_shutting_down())
-                try_drain_overflow(overflow, log.queue_);
-
-            if (!log.flusher_running()) log.flush_once_batch();
+            if (!lg->flusher_running())
+                lg->flush_once_batch();
         }
 
         template <typename... Args>
@@ -198,32 +179,37 @@ namespace usub::ulog
                 buf.resize(static_cast<size_t>(needed) + 1);
             }
             va_end(ap);
-            const uint32_t len = utf8_safe_size(buf.data(), std::strlen(buf.data()), kMaxLogLineBytes);
+            const uint32_t len =
+                utf8_safe_size(buf.data(), std::strlen(buf.data()), kMaxLogLineBytes);
             enqueue_with_overflow(lvl, buf.data(), len);
         }
 
         void flush_once_batch() noexcept;
 
-        inline uint64_t flush_interval_ns() const noexcept { return flush_interval_ns_; }
-
-        inline uint64_t get_overflow_pushes() const noexcept
+        inline uint64_t flush_interval_ns() const noexcept
         {
-            return metric_overflow_pushes_.load(std::memory_order_relaxed);
+            return flush_interval_ns_;
         }
 
-        inline uint64_t get_backpressure_spins() const noexcept
+        inline uint64_t get_overflow_events() const noexcept
         {
-            return metric_backpressure_spins_.load(std::memory_order_relaxed);
+            return metric_overflows_.load(std::memory_order_relaxed);
         }
 
-        inline uint64_t get_backpressure_failures() const noexcept
+        inline bool is_shutting_down() const noexcept
         {
-            return metric_backpressure_failures_.load(std::memory_order_relaxed);
+            return shutting_down_.load(std::memory_order_acquire);
         }
 
-        inline bool is_shutting_down() const noexcept { return shutting_down_.load(std::memory_order_acquire); }
-        inline void mark_flusher_started() noexcept { flusher_started_.store(true, std::memory_order_release); }
-        inline bool flusher_running() const noexcept { return flusher_started_.load(std::memory_order_acquire); }
+        inline void mark_flusher_started() noexcept
+        {
+            flusher_started_.store(true, std::memory_order_release);
+        }
+
+        inline bool flusher_running() const noexcept
+        {
+            return flusher_started_.load(std::memory_order_acquire);
+        }
 
     private:
         struct Sink
@@ -241,8 +227,7 @@ namespace usub::ulog
                std::size_t max_file_size_bytes,
                uint32_t max_files,
                bool json_mode,
-               bool track_metrics,
-               uint32_t max_backpressure_retries) noexcept;
+               bool track_metrics) noexcept;
 
         Logger(const Logger&) = delete;
         Logger& operator=(const Logger&) = delete;
@@ -250,7 +235,9 @@ namespace usub::ulog
         static inline uint64_t now_ms_wallclock() noexcept
         {
             using namespace std::chrono;
-            return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+            return duration_cast<milliseconds>(
+                    system_clock::now().time_since_epoch())
+                .count();
         }
 
         static inline uint32_t get_thread_id_fast() noexcept
@@ -275,7 +262,10 @@ namespace usub::ulog
         template <typename T>
         static inline void append_one(std::string& out, const T& v) noexcept
         {
-            if constexpr (std::is_same_v<T, std::string>) out.append(v);
+            if constexpr (std::is_same_v<T, std::string>)
+            {
+                out.append(v);
+            }
             else if constexpr (std::is_convertible_v<T, std::string_view>)
             {
                 std::string_view sv(v);
@@ -301,10 +291,16 @@ namespace usub::ulog
             }
         }
 
-        static inline void fmt_build(std::string& out, std::string_view fmt) noexcept { out.append(fmt); }
+        static inline void fmt_build(std::string& out, std::string_view fmt) noexcept
+        {
+            out.append(fmt);
+        }
 
         template <typename Arg, typename... Rest>
-        static inline void fmt_build(std::string& out, std::string_view fmt, Arg&& a, Rest&&... rest) noexcept
+        static inline void fmt_build(std::string& out,
+                                     std::string_view fmt,
+                                     Arg&& a,
+                                     Rest&&... rest) noexcept
         {
             size_t p = fmt.find("{}");
             if (p == std::string_view::npos)
@@ -326,52 +322,6 @@ namespace usub::ulog
             return static_cast<uint32_t>(i + 1);
         }
 
-        template <std::size_t N>
-        struct ThreadOverflowRing
-        {
-            std::vector<LogEntry> buf;
-            uint16_t head = 0;
-            uint16_t tail = 0;
-
-            ThreadOverflowRing() : buf(N)
-            {
-            }
-
-            inline bool try_push(const LogEntry& e) noexcept
-            {
-                uint16_t next = uint16_t((tail + 1) % N);
-                if (next == head) return false;
-                buf[tail] = e;
-                tail = next;
-                return true;
-            }
-
-            inline bool try_pop(LogEntry& out) noexcept
-            {
-                if (head == tail) return false;
-                out = buf[head];
-                head = uint16_t((head + 1) % N);
-                return true;
-            }
-
-            inline void rollback_last_pop() noexcept { head = static_cast<uint16_t>((head + N - 1) % N); }
-        };
-
-        template <std::size_t N>
-        static inline void try_drain_overflow(ThreadOverflowRing<N>& overflow,
-                                              queue::concurrent::MPMCQueue<LogEntry>& q) noexcept
-        {
-            LogEntry tmp;
-            while (overflow.try_pop(tmp))
-            {
-                if (!q.try_enqueue(tmp))
-                {
-                    overflow.rollback_last_pop();
-                    break;
-                }
-            }
-        }
-
         void maybe_rotate_sink(size_t idx, size_t incoming_bytes) noexcept;
         static void rotate_files(const char* path, uint32_t max_files) noexcept;
 
@@ -386,14 +336,14 @@ namespace usub::ulog
         uint32_t max_files_;
         bool json_mode_;
         bool track_metrics_;
-        uint32_t max_backpressure_retries_;
 
         std::atomic<bool> shutting_down_;
         std::atomic<bool> flusher_started_{false};
-        std::atomic<uint64_t> metric_overflow_pushes_{0};
-        std::atomic<uint64_t> metric_backpressure_spins_{0};
-        std::atomic<uint64_t> metric_backpressure_failures_{0};
+        std::atomic<uint64_t> metric_overflows_{0};
+
         queue::concurrent::MPMCQueue<LogEntry> queue_;
+        queue::single_thread::Queue<LogEntry> fallback_queue_;
+        std::mutex fallback_mutex_;
     };
 } // namespace usub::ulog
 

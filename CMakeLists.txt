@@ -11,10 +11,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0" CACHE STRING "Debug flags" FORCE)
 set(CMAKE_C_FLAGS_DEBUG "-g -O0" CACHE STRING "Debug flags" FORCE)
 
-add_compile_definitions(DEV_STAGE=${DEV_STAGE})
-
-message(STATUS "DEV_STAGE is set to ${DEV_STAGE}")
-
 include(FetchContent)
 
 FetchContent_Declare(
@@ -57,7 +53,9 @@ option(ULOG_BUILD_EXAMPLES "Build ulog example executables" ON)
 if (ULOG_BUILD_EXAMPLES)
     add_executable(ulog_example examples/main.cpp)
     target_link_libraries(ulog_example PRIVATE ulog)
-    target_compile_definitions(ulog_example PRIVATE DEV_STAGE=${DEV_STAGE})
+
+    add_executable(ulog_mutex_fallback examples/main_mutex_fallback.cpp)
+    target_link_libraries(ulog_mutex_fallback PRIVATE ulog)
 endif ()
 
 install(TARGETS ulog
