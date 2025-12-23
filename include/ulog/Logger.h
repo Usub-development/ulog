@@ -331,12 +331,43 @@ namespace usub::ulog {
                 !is_variant_v<T> &&
                 (ureflect_member_count_v<rmcvref_t<T> > > 0);
 
+        static inline void append_escaped(std::string &out, std::string_view sv) noexcept {
+            for (unsigned char c: sv) {
+                switch (c) {
+                    case '\\': out.append("\\\\");
+                        break;
+                    case '"': out.append("\\\"");
+                        break;
+                    case '\n': out.append("\\n");
+                        break;
+                    case '\r': out.append("\\r");
+                        break;
+                    case '\t': out.append("\\t");
+                        break;
+                    default:
+                        if (c < 0x20) {
+                            char b[8];
+                            int n = ::snprintf(b, sizeof(b), "\\x%02X", (unsigned) c);
+                            if (n > 0) out.append(b, (size_t) n);
+                        } else {
+                            out.push_back((char) c);
+                        }
+                }
+            }
+        }
+
+        static inline void append_quoted(std::string &out, std::string_view sv) noexcept {
+            out.push_back('"');
+            append_escaped(out, sv);
+            out.push_back('"');
+        }
+
         static inline void append_cstr(std::string &out, const char *s) noexcept {
             if (!s) {
                 out.append("null");
                 return;
             }
-            out.append(s);
+            append_quoted(out, std::string_view{s});
         }
 
         template<class T>
@@ -379,12 +410,12 @@ namespace usub::ulog {
             } else if constexpr (std::is_same_v<U, std::nullopt_t>) {
                 out.append("null");
             } else if constexpr (is_cstr_v<T>) {
-                append_cstr(out, (const char *) v);
+                append_cstr(out, (const char*)v);
             } else if constexpr (std::is_same_v<U, std::string>) {
-                out.append(v);
+                append_quoted(out, std::string_view{v});
             } else if constexpr (is_sv_convertible_v<T>) {
                 std::string_view sv(v);
-                out.append(sv.data(), sv.size());
+                append_quoted(out, sv);
             } else if constexpr (std::is_same_v<U, bool>) {
                 out.append(v ? "true" : "false");
             } else if constexpr (std::is_enum_v<U>) {

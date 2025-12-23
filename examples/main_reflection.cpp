@@ -55,7 +55,7 @@ usub::uvent::task::Awaitable<void> test_reflection()
         .roles = {"user", "viewer"},
     };
 
-    usub::ulog::trace("user u1: {1}, user u2: {0}", u2, u1);
+    usub::ulog::trace("user u1: {1}, user u2: {0}, user u1 again: {1}", u2, u1);
     co_return;
 }
 
