@@ -18,8 +18,14 @@ FetchContent_Declare(
         GIT_REPOSITORY https://github.com/Usub-development/uvent.git
         GIT_TAG main
 )
+FetchContent_Declare(
+        ureflect
+        GIT_REPOSITORY https://github.com/Usub-development/ureflect.git
+        GIT_TAG main
+        OVERRIDE_FIND_PACKAGE
+)
 
-FetchContent_MakeAvailable(uvent)
+FetchContent_MakeAvailable(uvent ureflect)
 
 file(GLOB_RECURSE ULOG_HEADERS CONFIGURE_DEPENDS
         ${CMAKE_CURRENT_SOURCE_DIR}/include/ulog/*.h
@@ -41,6 +47,7 @@ target_include_directories(ulog
 target_link_libraries(ulog
         PUBLIC
         usub::uvent
+        usub::ureflect
 )
 
 set_target_properties(ulog PROPERTIES
@@ -54,8 +61,11 @@ if (ULOG_BUILD_EXAMPLES)
     add_executable(ulog_example examples/main.cpp)
     target_link_libraries(ulog_example PRIVATE ulog)
 
-    add_executable(ulog_mutex_fallback examples/main_mutex_fallback.cpp)
-    target_link_libraries(ulog_mutex_fallback PRIVATE ulog)
+    add_executable(ulog_mutex_fallback_example examples/main_mutex_fallback.cpp)
+    target_link_libraries(ulog_mutex_fallback_example PRIVATE ulog)
+
+    add_executable(ulog_reflection_example examples/main_reflection.cpp)
+    target_link_libraries(ulog_reflection_example PRIVATE ulog)
 endif ()
 
 install(TARGETS ulog
