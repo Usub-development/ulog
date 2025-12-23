@@ -309,6 +309,18 @@ namespace usub::ulog {
                 !is_variant_v<T> &&
                 !is_std_array_v<T>;
 
+        template<class T, class = void>
+        struct ureflect_member_count : std::integral_constant<std::size_t, 0> {
+        };
+
+        template<class T>
+        struct ureflect_member_count<T, std::void_t<decltype(ureflect::count_members<T>)> >
+                : std::integral_constant<std::size_t, (std::size_t) ureflect::count_members<T>> {
+        };
+
+        template<class T>
+        static inline constexpr std::size_t ureflect_member_count_v = ureflect_member_count<T>::value;
+
         template<class T>
         static inline constexpr bool is_reflectable_aggregate_v =
                 std::is_aggregate_v<rmcvref_t<T> > &&
@@ -317,7 +329,7 @@ namespace usub::ulog {
                 !is_range_v<T> &&
                 !is_optional_v<T> &&
                 !is_variant_v<T> &&
-                (ureflect::count_members<rmcvref_t<T> > > 0);
+                (ureflect_member_count_v<rmcvref_t<T> > > 0);
 
         static inline void append_cstr(std::string &out, const char *s) noexcept {
             if (!s) {
@@ -363,6 +375,8 @@ namespace usub::ulog {
             using U = rmcvref_t<T>;
 
             if constexpr (std::is_same_v<U, std::nullptr_t>) {
+                out.append("null");
+            } else if constexpr (std::is_same_v<U, std::nullopt_t>) {
                 out.append("null");
             } else if constexpr (is_cstr_v<T>) {
                 append_cstr(out, (const char *) v);
@@ -512,7 +526,6 @@ namespace usub::ulog {
             }
 
             append_literal(lit, e);
-
         }
 
         static inline uint32_t utf8_safe_size(const char *data, size_t len, size_t max_bytes) {
